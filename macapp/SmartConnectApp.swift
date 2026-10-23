@@ -909,6 +909,46 @@ struct MenuPhoneSection: View {
 }
 
 /// The menu panel's Streams section: view tiles, running streams and the phone's app list.
+/// One icon cell of the phone-app grid (Streams page and the menu panel's Streams card):
+/// the launcher icon with the app name under it; a click starts the app on the phone.
+private struct StreamAppGridCell: View {
+    let app: StreamHost.StreamApp
+    let iconSize: CGFloat
+    let twoLineName: Bool
+    let start: (StreamHost.StreamApp) -> Void
+
+    var body: some View {
+        Button {
+            start(app)
+        } label: {
+            VStack(spacing: 4) {
+                if let img = StreamHost.iconImage(app.iconName) {
+                    Image(nsImage: img)
+                        .resizable()
+                        .frame(width: iconSize, height: iconSize)
+                        .clipShape(RoundedRectangle(cornerRadius: iconSize * 0.22, style: .continuous))
+                        .shadow(color: .black.opacity(0.15), radius: 1.5, y: 1)
+                } else {
+                    Image(systemName: "app")
+                        .font(.system(size: iconSize * 0.75))
+                        .foregroundStyle(.secondary)
+                        .frame(width: iconSize, height: iconSize)
+                }
+                Text(app.work ? "\(app.name) · work" : app.name)
+                    .font(.caption2)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(twoLineName ? 2 : 1)
+                    .frame(height: twoLineName ? 26 : 13)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(app.work ? "\(app.name) · work — \(app.pkg)" : "\(app.name) — \(app.pkg)")
+    }
+}
+
 struct MenuStreamsSection: View {
     private var _daemon: EnvironmentObject<DaemonClient> = EnvironmentObject()
     private var daemon: DaemonClient { _daemon.wrappedValue }
@@ -968,30 +1008,11 @@ struct MenuStreamsSection: View {
                     .textFieldStyle(.roundedBorder)
                     .controlSize(.small)
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 62), spacing: 6)], spacing: 6) {
                         ForEach(filtered, id: \.key) { app in
-                            Button {
-                                host.startApp(app)
-                            } label: {
-                                HStack(spacing: 8) {
-                                    if let img = StreamHost.iconImage(app.iconName) {
-                                        Image(nsImage: img)
-                                            .resizable()
-                                            .frame(width: 22, height: 22)
-                                            .clipShape(RoundedRectangle(cornerRadius: 5))
-                                    } else {
-                                        Image(systemName: "app")
-                                            .foregroundStyle(.secondary)
-                                            .frame(width: 22)
-                                    }
-                                    Text(app.work ? "\(app.name) · work" : app.name)
-                                        .lineLimit(1)
-                                        .font(.callout)
-                                    Spacer()
-                                }
-                                .contentShape(Rectangle())
+                            StreamAppGridCell(app: app, iconSize: 30, twoLineName: false) {
+                                host.startApp($0)
                             }
-                            .buttonStyle(.plain)
                         }
                     }
                 }
@@ -1464,25 +1485,12 @@ struct StreamsContent: View {
                          : "Connect the phone to load its apps.")
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
-                    ForEach(filtered, id: \.key) { app in
-                        HStack(spacing: 10) {
-                            if let img = StreamHost.iconImage(app.iconName) {
-                                Image(nsImage: img)
-                                    .resizable()
-                                    .frame(width: 28, height: 28)
-                                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                            } else {
-                                Image(systemName: "app").frame(width: 16)
-                                    .foregroundStyle(.secondary)
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 84), spacing: 10)], spacing: 10) {
+                        ForEach(filtered, id: \.key) { app in
+                            StreamAppGridCell(app: app, iconSize: 40, twoLineName: true) {
+                                host.startApp($0)
                             }
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(app.work ? "\(app.name) · work profile" : app.name).lineLimit(1)
-                                Text(app.pkg).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                            }
-                            Spacer()
-                            Button("Open") { host.startApp(app) }
                         }
-                        .font(.callout)
                     }
                 }
             }

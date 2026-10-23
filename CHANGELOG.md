@@ -10,6 +10,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The READM
 
 ### Added
 
+- macOS app: the phone's apps show as a **grid of icons** instead of a row list — on the window's
+  Streams page (40 pt launcher icons, two-line names, package in the hover tooltip) and in the
+  menu-bar panel's Streams card (30 pt icons, one-line names). Clicking an icon starts the app on
+  the phone directly via service 15 `cmd 1`; the old per-row *Open* button and package caption are
+  gone. Search still filters the grid and work-profile entries keep their "· work" suffix.
+
 - macOS app: clicking a notification whose app also lives on the Mac (WhatsApp, Telegram, Discord,
   Spotify, Slack, Teams, Outlook, Zoom, Instagram — or any app whose name matches an installed
   `/Applications/<name>.app`) opens the local Mac app instead of streaming the phone's copy; the

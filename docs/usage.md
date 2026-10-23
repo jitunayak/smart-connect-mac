@@ -371,12 +371,17 @@ Each phone app opens in its own Linux window, titled after the app (for example
 
   `--app` goes through the stream host if one is running. Otherwise it streams from its own process
   and exits when its windows close.
-- **macOS app:** the phone's apps are listed in the *Streams* page of the SmartConnect window
+- **macOS app:** the phone's apps show as a **grid of launcher icons** (name under each icon;
+  hovering shows the package) in the *Streams* page of the SmartConnect window
   (the window's left rail: dummy phone on top, then the Phone / Streams / Notifications / Settings
   pages, like the Windows app) and in the
-  menu-bar panel's Streams card (icon, cached icons and a search field; the circular
-  **Refresh** button asks the phone for the list again), **Open** starts one, and **Running
-  streams** lists the open streams with Close buttons. Starting an app sends
+  menu-bar panel's Streams card (smaller icon grid, cached icons and a search field; the circular
+  **Refresh** button asks the phone for the list again). **Clicking an icon starts that app on the
+  phone** (no separate Open button), and **Running
+  streams** lists the open streams with Close buttons. The list is cached in
+  `~/Library/Caches/SmartConnect/apps-cache.json`, so a surface opens with the apps already in
+  place and a fresh list is requested at most every 5 minutes while the phone is connected.
+  Starting an app sends
   service 15 `cmd 1` with the app's `cmp` and `userId` (`source: 0`) just like `--app`.
   (🟡 the list and flows are implemented; recent app-stream starts on the phone have been seen to
   open a working window, but a focused side-by-side verification of `--app` apps happened for
