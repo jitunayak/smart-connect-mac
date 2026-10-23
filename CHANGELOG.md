@@ -139,6 +139,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The READM
 
 ### Fixed
 
+- macOS app: **Settings ✓ *Show SmartConnect in the Dock*** now remembers the choice. The toggle bound `_showInDock.projectedValue`, which writes only the SwiftUI `State` — its own setter (the one that called `UserDefaults`) was never reached, so the Dock tile appeared until the next launch and every launch went back to menu-bar-only. The value is now saved as the toggle changes, and launch-time activation already reads it, so the Dock preference survives a restart.
 - macOS: the phone's **PC lock** tile verifies end to end on this OS (`SACLockScreenImmediate`
   locks the screen). The daemon previously watched the unlock by polling the session dictionary,
   whose lock key no longer appears on current macOS — the phone's tile would have stayed "locked"
@@ -197,6 +198,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The READM
 
 ### Changed
 
+- macOS app: **a notification that carries a one-time code copies it by itself** — its banner is now sensitive and never shows the code (the digits render as bullets), the code is read from the phone's *Messages* (the conversation behind the sender, else the one whose last message carries that very code, else the notification's own text) and put on the Mac's pasteboard as the notification arrives, and a short **OTP copied** notice confirms it without repeating the digits. The banner keeps **Copy OTP** as a fallback, which takes the code from `userInfo` rather than the screen and whose own confirmation no longer prints it either. `OTPFinder` grew `masked(_:)` for the bullets; the matching rules are unchanged.
 - GTK app: the window was restructured to a shared design. A header **device menu** (left of the title) shows the connected device and holds *Pair new phone…*, *Preferences* (the *Start at login* switch) and *Connect/Disconnect* — moved out of the pages. The view switcher now has five pages: *Phone* (a compact phone card with wallpaper, name, an inline battery/Wi-Fi/mobile/Bluetooth row and **Mirror screen**, an unread-messages shortcut to Notifications, and the Cross Control switch), *Apps* (search + Recent chips + an icon grid), *Display* (a phone-as-display card over Layout / Experimental / Advanced groups), *Files* (a storage card with a *Read-only* badge, **Open in Files**, quick-folder shortcuts, and a *Mount automatically when connected* switch) and *Notifications* (grouped under *Today* with **Clear all** and a per-notification **⋯** menu for *Open on phone* / *Dismiss* / *Mute app*). Pairing is now a dialog opened from the device menu. All controls follow the system light/dark theme and accent colour. No change to the control-socket wiring, mirror/app-streaming, display sessions, mount lifecycle, tray or autostart behaviour.
 
 ### Added

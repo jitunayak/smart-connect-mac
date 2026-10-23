@@ -7,7 +7,7 @@ Windows PC. The phone runs the stock, unmodified app: no root, no extra app, no 
 Pair once by scanning a QR code, and you get:
 
 - phone **notifications** on the Mac, with quick reply and action buttons
-- **Copy OTP** — a one-time code in a message becomes a one-tap *Copy OTP* action
+- **Copy OTP** — a one-time code in a notification copies itself to the Mac, banner hidden
 - **SMS** in a Messages page: threads, conversation view, send, mark read
 - **iPhone-style calling** — a ringing card for incoming calls and a menu-bar call pill with
   live timer, mute, speaker and end
@@ -116,7 +116,7 @@ its protocol work with the Linux project, so details on each service live in the
 | Feature | Status | Notes |
 |---|---|---|
 | Phone notifications with quick reply | ✅ | Shown in the menu-bar panel, the Notifications page and as macOS banners. Reply from the panel or the window. |
-| Copy OTP | ✅ | A one-time code in a notification (or an SMS) gets a one-tap *Copy OTP* action that puts the code on the Mac's pasteboard. See [Copy OTP](#copy-otp). |
+| Copy OTP | ✅ | A one-time code in a notification (or an SMS) copies itself to the Mac's pasteboard on arrival while the banner hides the code behind bullets; *Copy OTP* stays as a fallback. See [Copy OTP](#copy-otp). |
 | Notification action buttons ("Mark as read", ...) | 🟡 | Sent to the phone through a short, windowless app-streaming session, as the Windows app does. |
 | Open on phone | 🟡 | Opens the app in a streamed window for apps that have no reply action. |
 | Clipboard text, both ways | ✅ | Password-manager copies (concealed pasteboard types) are never sent to the phone. |
@@ -181,18 +181,25 @@ mirroring geometry.
 <details>
 <summary><h2>Copy OTP</h2></summary>
 
-When an SMS — or any app notification — carries a one-time code, the Mac gets a **Copy OTP** action:
+When an SMS — or any app notification — carries a one-time code, the Mac handles it by itself:
 
-- the macOS banner gains **Copy OTP** as its first button,
-- the notifications rows in the panel and the Notifications page show a copy pill next to
-  Reply / Open,
+- the notification is **sensitive**: its banner shows the digits as bullets, so no code is ever
+  on screen,
+- the code is read from the phone's **Messages** (the conversation behind the sender, else the
+  conversation whose last message carries exactly that code, else the notification's own text)
+  and lands on the Mac's pasteboard as the notification arrives,
+- a short **OTP copied** follow-up says the code is on your clipboard — by name, but never its
+  digits,
+- the notifications rows in the panel and the Notifications page still show a copy pill next to
+  Reply / Open, and the banner keeps **Copy OTP** as a fallback for the rare missed copy (it
+  reads the code from the notification, not from the screen),
 - and the Messages page shows a **Copy code** banner above a conversation, with a code chip on the
   message itself.
 
-Tapping it copies the code to the Mac's pasteboard locally — the notification is *not* opened on the
-phone or marked handled — and a short "OTP copied" confirmation follows. A code is recognised when a
-keyword (`otp`, `passcode`, `password`, `pin`, `code`) sits within 40 characters of a 4–8 digit
-group, or when the body is just the digits.
+Copying is local — the notification is *not* opened on the phone or marked handled. A code is
+recognised when a keyword (`otp`, `passcode`, `password`, `pin`, `code`) sits within 40 characters
+of a 4–8 digit group, or when the body is just the digits; a code read out of Messages is used
+only when it agrees with the one the notification carried.
 
 </details>
 

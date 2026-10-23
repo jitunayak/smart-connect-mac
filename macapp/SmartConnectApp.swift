@@ -1159,6 +1159,10 @@ final class NotificationBridge: NSObject {
     static let shared = NotificationBridge()
     private var started = false
     private var categories = Set<UNNotificationCategory>()
+    /// Sensitive notifications that already put their code on the clipboard (key → code, when):
+    /// an update (Android re-posts the same key) must not wrestle the clipboard back from the
+    /// user's own copy right after they pasted it somewhere.
+    private var autoCopied: [String: (code: String, at: Date)] = [:]
 
     func start() {
         guard !started else { return }
@@ -1209,8 +1213,8 @@ final class NotificationBridge: NSObject {
         }
         let title = (frame.title?.isEmpty == false ? frame.title! : app)
         let body = frame.body ?? ""
-        // A one-time code in the text drives the banner's "Copy OTP" button and the
-        // list rows' copy pill.
+        // A one-time code in the text marks the notification sensitive (see below) and drives
+        // the list rows' copy pill.
         let otp = OTPFinder.otp(in: body)
         DaemonClient.shared.note(PhoneNotification(
             key: key,
@@ -1235,7 +1239,12 @@ final class NotificationBridge: NSObject {
         let content = UNMutableNotificationContent()
         content.title = title
         content.subtitle = app
-        content.body = body
+        // Sensitive: a code-bearing notification never shows its code. The banner carries the
+        // message with the digits bulleted out; the code itself is read from the phone's
+        // Messages and put on the clipboard (`autoCopyCode`), which then says only that it
+        // happened. The "Copy OTP" action stays as a fallback and pulls the code out of
+        // `userInfo`, never off the screen.
+        content.body = otp == nil ? body : (OTPFinder.masked(body) ?? body)
         content.sound = .default
         content.threadIdentifier = key
         content.userInfo = ["key": key, "service": frame.service ?? 5, "app": app,
@@ -1256,6 +1265,81 @@ final class NotificationBridge: NSObject {
                 NSLog("SmartConnect: failed to deliver notification \(key): \(error)")
             }
         }
+        // A sensitive notification copies itself: nothing to read off the screen, nothing to
+        // tap. The message store answers first, the notification text is only the fallback.
+        if otp != nil {
+            Task { await self.autoCopyCode(key: key, sender: title, hint: otp) }
+        }
+    }
+
+    /// A sensitive notification's code, read from the phone's Messages and put on the
+    /// pasteboard, followed by a notice that says *only* that it happened — the digits never
+    /// reach a banner. The message store answers first so the code comes from the same SMS the
+    /// notification mirrors; a code found there is used only when it agrees with the
+    /// notification's own text (or the notification carried none), so this never copies a
+    /// different code than the one belonging to this notification.
+    @MainActor private func autoCopyCode(key: String, sender: String, hint: String?) async {
+        let code = await Self.codeFromMessages(sender: sender, hint: hint) ?? hint
+        guard let code else {
+            NSLog("SmartConnect: notifications: \(key) carries no code: nothing to copy")
+            return
+        }
+        let now = Date()
+        autoCopied = autoCopied.filter { now.timeIntervalSince($0.value.at) < 300 }
+        if autoCopied[key]?.code == code { return }
+        autoCopied[key] = (code, now)
+        OTPFinder.copyToPasteboard(code)
+        let confirm = UNMutableNotificationContent()
+        confirm.title = "OTP copied"
+        confirm.body = "The code from \(sender) is on your clipboard."
+        let request = UNNotificationRequest(identifier: "otp-copy:\(key)", content: confirm, trigger: nil)
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+        NSLog("SmartConnect: notifications: auto-copied the code for \(key)")
+    }
+
+    /// The code behind a sensitive notification, read out of the phone's Messages: first the
+    /// conversation named like the notification's sender, else the one whose last message
+    /// carries exactly the code the notification showed, then that conversation's newest
+    /// message when the row's preview has no code. It reads the daemon's own cache (`sms_state`,
+    /// `sms_thread`), never a sync request, so a notification lookup costs the phone no traffic
+    /// and can't open an allow prompt. Returns nil when Messages says nothing usable, so the
+    /// caller falls back to the notification's own text.
+    @MainActor private static func codeFromMessages(sender: String, hint: String?) async -> String? {
+        guard let listed = await send(["cmd": "sms_state"]),
+              let threads = listed["threads"] as? [[String: Any]] else {
+            return nil
+        }
+        let want = sender.lowercased()
+        let thread = threads.first { t in
+            let names = [t["name"] as? String, t["address"] as? String, t["thread"] as? String]
+                .compactMap { $0?.lowercased() }
+            guard !want.isEmpty else { return false }
+            return names.contains { !$0.isEmpty && ($0.contains(want) || want.contains($0)) }
+        } ?? threads.first { t in
+            guard let hint else { return false }
+            return OTPFinder.otp(in: t["last_body"] as? String ?? "") == hint
+        }
+        guard let thread else { return nil }
+        if let last = thread["last_body"] as? String, let code = OTPFinder.otp(in: last),
+           hint == nil || code == hint {
+            return code
+        }
+        // The thread row only carries a preview: read the conversation for its newest code.
+        guard let key = thread["thread"] as? String,
+              let loaded = await send(["cmd": "sms_thread", "thread": key]) else { return nil }
+        let messages = (loaded["messages"] as? [[String: Any]] ?? []).compactMap(SMSMsg.init)
+        for m in messages.reversed() {
+            if let code = OTPFinder.otp(in: m.body), hint == nil || code == hint { return code }
+        }
+        return nil
+    }
+
+    /// One control-socket command for `codeFromMessages`: a plain read of the daemon's cache, with
+    /// no side effect on the phone.
+    @MainActor private static func send(_ obj: [String: Any]) async -> [String: Any]? {
+        guard let data = try? JSONSerialization.data(withJSONObject: obj),
+              let line = String(data: data, encoding: .utf8) else { return nil }
+        return await DaemonClient.shared.request(line)
     }
 
     /// UN categories must exist before a notification is delivered. Build one per notification
@@ -1270,7 +1354,9 @@ final class NotificationBridge: NSObject {
                 actions.append(UNNotificationAction(identifier: "a\(a.id)", title: title, options: []))
             }
         } else {
-            // A one-time code in the text: "Copy OTP" is the first and most-used button.
+            // A one-time code copies itself when the notification arrives (`autoCopyCode`), so
+            // "Copy OTP" only stays as the fallback for when that copy missed — the code in
+            // it rides in `userInfo` and is never displayed anywhere.
             if let otp = OTPFinder.otp(in: frame.body ?? ""), !otp.isEmpty {
                 actions.append(UNNotificationAction(identifier: "copyotp", title: "Copy OTP", options: []))
             }
@@ -1328,13 +1414,15 @@ extension NotificationBridge: UNUserNotificationCenterDelegate {
                 DaemonClient.shared.reply(key: key, text: text)
                 DaemonClient.shared.markHandled(key: key)
             } else if action == "copyotp", let otp = info["otp"] as? String, !otp.isEmpty {
-                // Copying stays local: the notification is not opened on the phone and is not
-                // marked handled — the user may still want to reply to or open it. A short
-                // banner confirms what landed on the clipboard (the tap's own banner is gone).
+                // Fallback for a notification whose automatic copy missed (the code comes out
+                // of `userInfo`, never off the screen). Copying stays local: the notification
+                // is not opened on the phone and is not marked handled — the user may still
+                // want to reply to or open it. The notice says only that it happened; nothing
+                // on screen ever shows a sensitive code.
                 OTPFinder.copyToPasteboard(otp)
                 let confirm = UNMutableNotificationContent()
                 confirm.title = "OTP copied"
-                confirm.body = "\(otp) is on your clipboard."
+                confirm.body = "The code is on your clipboard."
                 let request = UNNotificationRequest(identifier: "otp-copy:\(key)", content: confirm, trigger: nil)
                 UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
                 NSLog("SmartConnect: notifications: copied OTP for \(key)")
@@ -1920,7 +2008,7 @@ struct MenuMessagesSection: View {
                                     }
                                 }
                                 Text(t["last_body"] as? String ?? "")
-                                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                    .font(.caption).foregroundStyle(.secondary).lineLimit(2)
                             }
                             Spacer(minLength: 8)
                         }
@@ -2766,7 +2854,20 @@ struct NotificationsView: View {
 /// a bare "123456", "123 456", "code expires in 10 min: 7-8-1-2", "otp: 482-913", "PIN 9911";
 /// rejected: "txn 998877", "meet at 5 near gate 4", "555-77 is reserved for help".
 enum OTPFinder {
-    static func otp(in text: String) -> String? {
+    static func otp(in text: String) -> String? { match(in: text)?.code }
+
+    /// The same text with its code hidden: digits become bullets (separators stay, so
+    /// "pin 123-456" reads as "pin •••-•••"). A sensitive banner shows this instead of the
+    /// message, so no code is ever on screen while the code itself goes to the clipboard.
+    static func masked(_ text: String) -> String? {
+        guard let (range, _) = match(in: text) else { return nil }
+        let hit = String(text[range])
+        return text.replacingCharacters(in: range, with: String(hit.map { $0.isNumber ? "•" : $0 }))
+    }
+
+    /// The digit group the keyword points at (or a body that is only digits), with its place in
+    /// the text so `masked` can hide exactly that group.
+    private static func match(in text: String) -> (range: Range<String.Index>, code: String)? {
         guard text.count < 600 else { return nil }
         func normalize(_ raw: String) -> String? {
             let digits = raw.filter(\.isNumber)
@@ -2779,22 +2880,26 @@ enum OTPFinder {
         keyword.enumerateMatches(in: text, options: [], range: full) { m, _, _ in
             if let m { kwEnds.append(m.range.upperBound) }
         }
-        var found: String?
+        var hit: NSRange?
+        var hitCode: String?
         group.enumerateMatches(in: text, options: [], range: full) { m, _, stop in
             guard let m, let range = Range(m.range, in: text) else { return }
             let start = m.range.location
             guard kwEnds.contains(where: { start - $0 <= 40 && start >= $0 - 2 }) else { return }
             if let code = normalize(String(text[range])) {
-                found = code
+                hit = m.range
+                hitCode = code
                 stop.pointee = true
             }
         }
-        if let found { return found }
+        if let hit, let code = hitCode, let range = Range(hit, in: text) {
+            return (range, code)
+        }
         if let bare = try? NSRegularExpression(pattern: "^[0-9][0-9 -]{2,9}[0-9]$"),
            let m = bare.firstMatch(in: text, options: [], range: full),
            let range = Range(m.range, in: text),
            let code = normalize(String(text[range])) {
-            return code
+            return (range, code)
         }
         return nil
     }
@@ -3008,7 +3113,7 @@ struct MessagesView: View {
                     Text(t["last_body"] as? String ?? "")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .lineLimit(2)
                 }
             }
             .padding(8)
@@ -3293,7 +3398,10 @@ struct SettingsView: View {
             Section("Appearance") {
                 Toggle("Show SmartConnect in the Dock", isOn: _showInDock.projectedValue)
                     .onChange(of: showInDock) { on in
-                        // Takes effect immediately; also saved for the next launch.
+                        // Takes effect immediately; also saved for the next launch. The toggle
+                        // writes the State directly (its binding is `_showInDock.projectedValue`),
+                        // so this is where the value has to be persisted for launch to see it.
+                        UserDefaults.standard.set(on, forKey: "showInDock")
                         NSApp.setActivationPolicy(on ? .regular : .accessory)
                     }
                 Text("When off, SmartConnect lives in the menu bar only (its current behaviour). When on, it also gets a Dock tile — closing the window then hides to the Dock instead of only the menu bar. The Dock icon also gives it a second way to reopen the window: clicking the tile.")
