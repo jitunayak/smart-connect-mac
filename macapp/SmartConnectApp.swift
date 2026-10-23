@@ -33,8 +33,8 @@ enum Paths {
     static let logs = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("Logs/SmartConnect", isDirectory: true)
     static let daemonLog = logs.appendingPathComponent("smartconnectd.log")
-    /// Cached phone app list (service 17 `cmd 1`), so the Streams surfaces open instantly even
-    /// before the phone answers the fresh request.
+    /// Cached phone app list (service 17 `cmd 1`), so the app grid (Streams on the Phone page
+    /// and the panel) opens instantly even before the phone answers the fresh request.
     static let appsCache = cache.appendingPathComponent("apps-cache.json")
 }
 
@@ -1209,6 +1209,9 @@ final class NotificationBridge: NSObject {
         }
         let title = (frame.title?.isEmpty == false ? frame.title! : app)
         let body = frame.body ?? ""
+        // A one-time code in the text drives the banner's "Copy OTP" button and the
+        // list rows' copy pill.
+        let otp = OTPFinder.otp(in: body)
         DaemonClient.shared.note(PhoneNotification(
             key: key,
             service: frame.service ?? 5,
@@ -1236,7 +1239,8 @@ final class NotificationBridge: NSObject {
         content.sound = .default
         content.threadIdentifier = key
         content.userInfo = ["key": key, "service": frame.service ?? 5, "app": app,
-                            "pkg": frame.pkg ?? "", "isCall": frame.isCall == true]
+                            "pkg": frame.pkg ?? "", "isCall": frame.isCall == true,
+                            "otp": otp ?? ""]
         content.categoryIdentifier = registerCategory(for: frame)
 
         let attachmentPath = frame.picture ?? frame.icon
@@ -1265,24 +1269,30 @@ final class NotificationBridge: NSObject {
                 let title = a.reply ? a.name : CallUX.display(a)
                 actions.append(UNNotificationAction(identifier: "a\(a.id)", title: title, options: []))
             }
-        } else if frame.replyable == true {
-            actions.append(UNTextInputNotificationAction(
-                identifier: "reply",
-                title: "Reply",
-                options: [],
-                textInputButtonTitle: "Send",
-                textInputPlaceholder: "Reply…"
-            ))
         } else {
-            actions.append(UNNotificationAction(
-                identifier: "open",
-                title: MacAppCounterpart.hasCounterpart(app: frame.app, pkg: frame.pkg)
-                    ? "Open on Mac" // the Mac app takes the click, not the streamed phone app
-                    : "Open on phone",
-                options: []
-            ))
-            for a in frame.actions ?? [] where !a.reply {
-                actions.append(UNNotificationAction(identifier: "a\(a.id)", title: a.name, options: []))
+            // A one-time code in the text: "Copy OTP" is the first and most-used button.
+            if let otp = OTPFinder.otp(in: frame.body ?? ""), !otp.isEmpty {
+                actions.append(UNNotificationAction(identifier: "copyotp", title: "Copy OTP", options: []))
+            }
+            if frame.replyable == true {
+                actions.append(UNTextInputNotificationAction(
+                    identifier: "reply",
+                    title: "Reply",
+                    options: [],
+                    textInputButtonTitle: "Send",
+                    textInputPlaceholder: "Reply…"
+                ))
+            } else {
+                actions.append(UNNotificationAction(
+                    identifier: "open",
+                    title: MacAppCounterpart.hasCounterpart(app: frame.app, pkg: frame.pkg)
+                        ? "Open on Mac" // the Mac app takes the click, not the streamed phone app
+                        : "Open on phone",
+                    options: []
+                ))
+                for a in frame.actions ?? [] where !a.reply {
+                    actions.append(UNNotificationAction(identifier: "a\(a.id)", title: a.name, options: []))
+                }
             }
         }
         let signature = actions.map(\.identifier).joined(separator: ",")
@@ -1317,6 +1327,17 @@ extension NotificationBridge: UNUserNotificationCenterDelegate {
             if action == "reply", let text = (response as? UNTextInputNotificationResponse)?.userText, !text.isEmpty {
                 DaemonClient.shared.reply(key: key, text: text)
                 DaemonClient.shared.markHandled(key: key)
+            } else if action == "copyotp", let otp = info["otp"] as? String, !otp.isEmpty {
+                // Copying stays local: the notification is not opened on the phone and is not
+                // marked handled — the user may still want to reply to or open it. A short
+                // banner confirms what landed on the clipboard (the tap's own banner is gone).
+                OTPFinder.copyToPasteboard(otp)
+                let confirm = UNMutableNotificationContent()
+                confirm.title = "OTP copied"
+                confirm.body = "\(otp) is on your clipboard."
+                let request = UNNotificationRequest(identifier: "otp-copy:\(key)", content: confirm, trigger: nil)
+                UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+                NSLog("SmartConnect: notifications: copied OTP for \(key)")
             } else if action == UNNotificationDefaultActionIdentifier {
                 // Call banners are click-through-free: actions only, never the streamed app.
                 if !isCall {
@@ -1539,8 +1560,9 @@ struct SmartConnectApp: App {
 struct MenuContent: View {
     private var _daemon: EnvironmentObject<DaemonClient> = EnvironmentObject()
     private var daemon: DaemonClient { _daemon.wrappedValue }
-    // The panel hosts the Streams and Notifications tabs directly (they used to be reachable
-    // only through the main window); the full-sized tabs stay there too.
+    // The panel hosts the Phone (with the streaming controls), Messages and Notifications
+    // sections directly (they used to be reachable only through the main window); the
+    // full-sized pages stay there too.
     private var _section: State<Int> = State(initialValue: 0)
 
     var body: some View {
@@ -1593,9 +1615,8 @@ struct MenuContent: View {
 
             Picker("Panel", selection: _section.projectedValue) {
                 Image(systemName: "iphone").tag(0)
-                Image(systemName: "play.rectangle").tag(1)
-                Image(systemName: "ellipsis.message").tag(2)
-                Image(systemName: "bell").tag(3)
+                Image(systemName: "ellipsis.message").tag(1)
+                Image(systemName: "bell").tag(2)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
@@ -1603,8 +1624,7 @@ struct MenuContent: View {
             Group {
                 switch _section.wrappedValue {
                 case 0: MenuPhoneSection()
-                case 1: MenuStreamsSection()
-                case 2: MenuMessagesSection()
+                case 1: MenuMessagesSection()
                 default: MenuNotificationsSection()
                 }
             }
@@ -1646,10 +1666,23 @@ struct MenuContent: View {
     }
 }
 
-/// The menu panel's Phone section: connection controls and the last action message.
+/// The menu panel's Phone section: connection controls, the streaming actions (the old Streams
+/// segment, merged in), running streams, the phone's app list and the last action message.
 struct MenuPhoneSection: View {
     private var _daemon: EnvironmentObject<DaemonClient> = EnvironmentObject()
     private var daemon: DaemonClient { _daemon.wrappedValue }
+    private var _host: ObservedObject<StreamHost> = ObservedObject(wrappedValue: StreamHost.shared)
+    private var host: StreamHost { _host.wrappedValue }
+    private var _search: State<String> = State(initialValue: "")
+    private var search: String { _search.wrappedValue }
+
+    private var filtered: [StreamHost.StreamApp] {
+        host.apps.filter {
+            search.isEmpty
+                || $0.name.localizedCaseInsensitiveContains(search)
+                || $0.pkg.localizedCaseInsensitiveContains(search)
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -1675,18 +1708,72 @@ struct MenuPhoneSection: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(daemon.online == false)
+
+                Button {
+                    host.startView(1)
+                } label: {
+                    Label("Screen share", systemImage: "play.rectangle")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(daemon.status?.connected != true)
+
+                Button {
+                    host.startView(2)
+                } label: {
+                    Label("Desktop", systemImage: "desktopcomputer")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(daemon.status?.connected != true)
             }
 
             if let message = daemon.lastMessage, !message.isEmpty {
                 Text(message).font(.caption).foregroundStyle(.secondary).lineLimit(2)
             }
+
+            ForEach(host.streamList, id: \.sid) { s in
+                HStack(spacing: 8) {
+                    Image(systemName: "rectangle.inset.bottomleft.filled").foregroundStyle(.secondary)
+                    Text(s.title).lineLimit(1)
+                    Spacer()
+                    Button("Close") { host.closeStream(s.sid) }
+                }
+                .font(.callout)
+            }
+
+            if host.apps.isEmpty {
+                Text(daemon.status?.connected == true
+                     ? "No app list yet — the phone sends it shortly after connecting; Refresh asks again."
+                     : "Connect the phone to load its apps.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                HStack {
+                    TextField("Search apps", text: _search.projectedValue)
+                        .textFieldStyle(.roundedBorder)
+                        .controlSize(.small)
+                    Button {
+                        host.requestApps()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .disabled(daemon.status?.connected != true)
+                }
+                ScrollView {
+                    StreamAppSections(apps: filtered, cellMin: 62, twoLineName: false) { app in
+                        host.startApp(app)
+                    }
+                }
+                .frame(maxHeight: 320)
+            }
         }
+        .onAppear { host.requestAppsIfStale() }
     }
 }
 
-/// The menu panel's Streams section: view tiles, running streams and the phone's app list.
-/// One icon cell of the phone-app grid (Streams page and the menu panel's Streams card):
-/// the launcher icon with the app name under it; a click starts the app on the phone.
+/// One icon cell of the phone-app grid (the Streams section of the window's Phone page and the
+/// menu panel's Phone card): the launcher icon with the app name under it; a click starts the
+/// app on the phone.
 private struct StreamAppGridCell: View {
     let app: StreamHost.StreamApp
     let iconSize: CGFloat
@@ -1725,77 +1812,45 @@ private struct StreamAppGridCell: View {
     }
 }
 
-struct MenuStreamsSection: View {
-    private var _daemon: EnvironmentObject<DaemonClient> = EnvironmentObject()
-    private var daemon: DaemonClient { _daemon.wrappedValue }
-    private var _host: ObservedObject<StreamHost> = ObservedObject(wrappedValue: StreamHost.shared)
-    private var host: StreamHost { _host.wrappedValue }
-    private var _search: State<String> = State(initialValue: "")
-    private var search: String { _search.wrappedValue }
+/// The phone-app grid in the phone-picker's sections: Games, TV apps, then everything else
+/// (the header is left off when no other section has content, so a plain list looks flat).
+/// Both the menu panel's Phone card and the window's Phone page take this.
+private struct StreamAppSections: View {
+    let apps: [StreamHost.StreamApp]
+    let cellMin: CGFloat
+    let twoLineName: Bool
+    let start: (StreamHost.StreamApp) -> Void
 
-    private var filtered: [StreamHost.StreamApp] {
-        host.apps.filter {
-            search.isEmpty
-                || $0.name.localizedCaseInsensitiveContains(search)
-                || $0.pkg.localizedCaseInsensitiveContains(search)
+    var body: some View {
+        let games = apps.filter { StreamHost.classify($0) == .game }
+        let tv = apps.filter { StreamHost.classify($0) == .tv }
+        let rest = apps.filter { StreamHost.classify($0) == .other }
+        let sectioned = !(games.isEmpty && tv.isEmpty)
+        return VStack(alignment: .leading, spacing: 10) {
+            section("Games", games)
+            section("TV apps", tv)
+            section(sectioned ? "Apps" : nil, rest)
         }
     }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
-                Button {
-                    host.startView(1)
-                } label: {
-                    Label("Screen share", systemImage: "play.rectangle").frame(maxWidth: .infinity)
+    @ViewBuilder
+    private func section(_ title: String?, _ apps: [StreamHost.StreamApp]) -> some View {
+        if !apps.isEmpty {
+            if let title {
+                HStack(spacing: 4) {
+                    Image(systemName: title == "Games" ? "gamecontroller"
+                                    : (title == "TV apps" ? "appletv" : "square.grid.3x3"))
+                        .font(.caption2)
+                    Text(title).font(.caption).fontWeight(.semibold)
                 }
-                Button {
-                    host.startView(2)
-                } label: {
-                    Label("Desktop", systemImage: "desktopcomputer").frame(maxWidth: .infinity)
-                }
-                Button {
-                    host.requestApps()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .disabled(daemon.status?.connected != true)
+                .foregroundStyle(.secondary)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(daemon.status?.connected != true)
-            ForEach(host.streamList, id: \.sid) { s in
-                HStack(spacing: 8) {
-                    Image(systemName: "rectangle.inset.bottomleft.filled").foregroundStyle(.secondary)
-                    Text(s.title).lineLimit(1)
-                    Spacer()
-                    Button("Close") { host.closeStream(s.sid) }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: cellMin), spacing: 6)], spacing: 6) {
+                ForEach(apps, id: \.key) { app in
+                    StreamAppGridCell(app: app, iconSize: cellMin * 0.48, twoLineName: twoLineName, start: start)
                 }
-                .font(.callout)
-            }
-
-            if host.apps.isEmpty {
-                Text(daemon.status?.connected == true
-                     ? "No app list yet — the phone sends it shortly after connecting; Refresh asks again."
-                     : "Connect the phone to load its apps.")
-                    .font(.caption).foregroundStyle(.secondary)
-            } else {
-                TextField("Search apps", text: _search.projectedValue)
-                    .textFieldStyle(.roundedBorder)
-                    .controlSize(.small)
-                ScrollView {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 62), spacing: 6)], spacing: 6) {
-                        ForEach(filtered, id: \.key) { app in
-                            StreamAppGridCell(app: app, iconSize: 30, twoLineName: false) {
-                                host.startApp($0)
-                            }
-                        }
-                    }
-                }
-                .frame(maxHeight: 320)
             }
         }
-        .onAppear { host.requestAppsIfStale() }
     }
 }
 
@@ -2027,6 +2082,9 @@ struct MenuNotificationsSection: View {
         get { _replyText.wrappedValue }
         nonmutating set { _replyText.wrappedValue = newValue }
     }
+    /// Keys whose "Copy OTP" pill just showed "Copied"; reset after 1.5 s (Messages-page style).
+    private var _copied: State<Set<String>> = State(initialValue: [])
+    private var copied: Set<String> { _copied.wrappedValue }
 
     var body: some View {
         let all = daemon.recentNotifications
@@ -2087,6 +2145,15 @@ struct MenuNotificationsSection: View {
                         // — the app itself is never opened or streamed for a call notification.
                         CallCardView(note: note, compact: true)
                     } else {
+                        if let code = OTPFinder.otp(in: note.body) {
+                            copyPill(note: note, code: code,
+                                     copied: copied, markCopied: { key in
+                                         _copied.wrappedValue.insert(key)
+                                         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                             _copied.wrappedValue.remove(key)
+                                         }
+                                     })
+                        }
                         if note.replyable {
                             Button("Reply") {
                                 replying = note
@@ -2136,10 +2203,9 @@ struct MainWindow: View {
                     .padding(.top, 42) // clears the traffic lights (full-size content view)
                     .padding(.bottom, 18)
                 navItem(0, icon: "iphone", label: "Phone")
-                navItem(1, icon: "play.rectangle", label: "Streams")
-                navItem(2, icon: "bell", label: "Notifications")
-                navItem(3, icon: "ellipsis.message", label: "Messages")
-                navItem(4, icon: "gearshape", label: "Settings")
+                navItem(1, icon: "bell", label: "Notifications")
+                navItem(2, icon: "ellipsis.message", label: "Messages")
+                navItem(3, icon: "gearshape", label: "Settings")
                 Spacer()
             }
             .frame(width: 232)
@@ -2152,9 +2218,8 @@ struct MainWindow: View {
             Group {
                 switch _section.wrappedValue {
                 case 0: PhoneView()
-                case 1: ScrollView { StreamsContent() }
-                case 2: NotificationsView()
-                case 3: MessagesView()
+                case 1: NotificationsView()
+                case 2: MessagesView()
                 default: SettingsView()
                 }
             }
@@ -2212,26 +2277,15 @@ struct StreamsContent: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Text("Streams").font(.title2.bold())
-                Spacer()
-                if daemon.status?.connected != true {
-                    Label("Phone not connected", systemImage: "iphone.slash")
-                        .font(.caption).foregroundStyle(.secondary)
+            // The section labels ("Streams", "Apps from the phone") stay off the page — the app
+            // grid follows the connection info directly, with Refresh riding the search row.
+            HStack(spacing: 8) {
+                if !host.apps.isEmpty {
+                    TextField("Search", text: _search.projectedValue)
+                        .textFieldStyle(.roundedBorder)
+                } else {
+                    Spacer()
                 }
-            }
-
-            HStack(spacing: 10) {
-                Button("Mirror screen") { host.startView(1) }
-                Button("Mobile desktop") { host.startView(2) }
-                Spacer()
-            }
-            .disabled(daemon.status?.connected != true)
-
-            Divider()
-            HStack {
-                Text("Apps from the phone").font(.headline)
-                Spacer()
                 Button {
                     host.requestApps()
                 } label: {
@@ -2240,15 +2294,10 @@ struct StreamsContent: View {
                 .labelStyle(.iconOnly)
                 .disabled(daemon.status?.connected != true)
             }
-            if !host.apps.isEmpty {
-                TextField("Search", text: _search.projectedValue)
-                    .textFieldStyle(.roundedBorder)
-            }
-            // One shared scroll (the merged tab's outer ScrollView owns scrolling here; a nested
+            // One shared scroll (the page's outer ScrollView owns scrolling here; a nested
             // scroll pane with 100+ apps would trap the mouse wheel).
             LazyVStack(alignment: .leading, spacing: 6) {
                 if !host.streamList.isEmpty {
-                    Text("Running streams").font(.headline).padding(.top, 2)
                     ForEach(host.streamList, id: \.sid) { s in
                         HStack(spacing: 8) {
                             Image(systemName: "rectangle.inset.bottomleft.filled")
@@ -2267,19 +2316,14 @@ struct StreamsContent: View {
                          : "Connect the phone to load its apps.")
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 84), spacing: 10)], spacing: 10) {
-                        ForEach(filtered, id: \.key) { app in
-                            StreamAppGridCell(app: app, iconSize: 40, twoLineName: true) {
-                                host.startApp($0)
-                            }
-                        }
+                    StreamAppSections(apps: filtered, cellMin: 84, twoLineName: true) { app in
+                        host.startApp(app)
                     }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.bottom, 12)
         }
-        .padding(8)
         .onAppear { host.requestAppsIfStale() }
     }
 }
@@ -2287,79 +2331,94 @@ struct StreamsContent: View {
 struct PhoneView: View {
     private var _daemon: EnvironmentObject<DaemonClient> = EnvironmentObject()
     private var daemon: DaemonClient { _daemon.wrappedValue }
+    private var _host: ObservedObject<StreamHost> = ObservedObject(wrappedValue: StreamHost.shared)
+    private var host: StreamHost { _host.wrappedValue }
     private var _showPairing: State<Bool> = State(initialValue: false)
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 14) {
-                Image(systemName: daemon.status?.connected == true ? "iphone.radiowaves.left.and.right" : "iphone.slash")
-                    .font(.system(size: 28))
-                    .foregroundStyle(daemon.status?.connected == true ? .green : .secondary)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(daemon.status?.name ?? "No phone paired").font(.title2.bold())
-                    Text(daemon.status?.connected == true ? (daemon.status?.model ?? "Connected") : "Not connected")
-                        .foregroundStyle(.secondary)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(spacing: 14) {
+                    Image(systemName: daemon.status?.connected == true ? "iphone.radiowaves.left.and.right" : "iphone.slash")
+                        .font(.system(size: 28))
+                        .foregroundStyle(daemon.status?.connected == true ? .green : .secondary)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(daemon.status?.name ?? "No phone paired").font(.title2.bold())
+                        Text(daemon.status?.connected == true ? (daemon.status?.model ?? "Connected") : "Not connected")
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
                 }
-                Spacer()
-            }
 
-            if let s = daemon.status {
                 HStack(spacing: 24) {
-                    InfoTile(title: "Battery", value: s.battery.map { "\($0)%" } ?? "—", icon: "battery.75")
-                    InfoTile(title: "Wi-Fi", value: s.wifi ? "On" : "Off", icon: "wifi")
-                    InfoTile(title: "Bluetooth", value: s.bluetooth ? "On" : "Off", icon: "dot.radiowaves.left.and.right")
-                    InfoTile(title: "Unread", value: s.unread.map(String.init) ?? "—", icon: "bell")
+                    if let s = daemon.status {
+                        InfoTile(title: "Battery", value: s.battery.map { "\($0)%" } ?? "—", icon: "battery.75")
+                        InfoTile(title: "Wi-Fi", value: s.wifi ? "On" : "Off", icon: "wifi")
+                        InfoTile(title: "Bluetooth", value: s.bluetooth ? "On" : "Off", icon: "dot.radiowaves.left.and.right")
+                    }
+                    InfoTile(title: "PC IP", value: daemon.status?.pcAddress ?? "—", icon: "desktopcomputer")
                 }
-            }
 
-            // Call card: iPhone-calling style. Ringing first (Accept/Decline), then ongoing (End).
-            if let call = daemon.ringingCall {
-                CallCardView(note: call, compact: false)
-                    .padding(12)
-                    .background(RoundedRectangle(cornerRadius: 12)
-                        .fill(Color.green.opacity(0.10)))
-                    .overlay(RoundedRectangle(cornerRadius: 12)
-                        .strokeBorder(Color.green.opacity(0.35)))
-            } else if let call = daemon.ongoingCall {
-                CallCardView(note: call, compact: false)
-                    .padding(12)
-                    .background(RoundedRectangle(cornerRadius: 12)
-                        .fill(Color.secondary.opacity(0.08)))
-                    .overlay(RoundedRectangle(cornerRadius: 12)
-                        .strokeBorder(Color.primary.opacity(0.07)))
-            }
-
-            HStack {
-                Button(daemon.status?.connected == true ? "Disconnect" : "Connect") {
-                    daemon.status?.connected == true ? daemon.disconnect() : daemon.connect()
+                // Call card: iPhone-calling style. Ringing first (Accept/Decline), then ongoing (End).
+                if let call = daemon.ringingCall {
+                    CallCardView(note: call, compact: false)
+                        .padding(12)
+                        .background(RoundedRectangle(cornerRadius: 12)
+                            .fill(Color.green.opacity(0.10)))
+                        .overlay(RoundedRectangle(cornerRadius: 12)
+                            .strokeBorder(Color.green.opacity(0.35)))
+                } else if let call = daemon.ongoingCall {
+                    CallCardView(note: call, compact: false)
+                        .padding(12)
+                        .background(RoundedRectangle(cornerRadius: 12)
+                            .fill(Color.secondary.opacity(0.08)))
+                        .overlay(RoundedRectangle(cornerRadius: 12)
+                            .strokeBorder(Color.primary.opacity(0.07)))
                 }
-                .keyboardShortcut(.defaultAction)
-                Button("Pair new phone…") {
-                    _showPairing.wrappedValue = true
-                    daemon.pair()
-                }
-                Spacer()
-                if daemon.online {
-                    Label("Daemon running", systemImage: "checkmark.circle")
-                        .font(.caption).foregroundStyle(.secondary)
-                } else {
-                    Label("Daemon not running", systemImage: "exclamationmark.triangle")
-                        .font(.caption).foregroundStyle(.orange)
-                }
-            }
 
-            if let message = daemon.lastMessage, !message.isEmpty {
-                Text(message).font(.callout).foregroundStyle(.secondary)
-            }
+                HStack {
+                    Button(daemon.status?.connected == true ? "Disconnect" : "Connect") {
+                        daemon.status?.connected == true ? daemon.disconnect() : daemon.connect()
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    Button("Pair new phone…") {
+                        _showPairing.wrappedValue = true
+                        daemon.pair()
+                    }
+                    // The stream starts sit right here with them instead of further down the
+                    // Streams section (disabled until the phone answers).
+                    Button {
+                        host.startView(1)
+                    } label: {
+                        Label("Mirror screen", systemImage: "play.rectangle")
+                    }
+                    .disabled(daemon.status?.connected != true)
+                    Button {
+                        host.startView(2)
+                    } label: {
+                        Label("Mobile desktop", systemImage: "desktopcomputer")
+                    }
+                    .disabled(daemon.status?.connected != true)
+                    Spacer()
+                    if daemon.online {
+                        Label("Daemon running", systemImage: "checkmark.circle")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Label("Daemon not running", systemImage: "exclamationmark.triangle")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                }
 
-            Divider()
-            Text("PC address: \(daemon.status?.pcAddress ?? "—") · Phone: \(daemon.status?.phoneAddress ?? "—")")
-                .font(.caption).foregroundStyle(.secondary)
-            Text("Pairing QR is served on TCP 52020 and advertised over Bonjour as _readyformdns._tcp.")
-                .font(.caption).foregroundStyle(.secondary)
-            Spacer()
+                if let message = daemon.lastMessage, !message.isEmpty {
+                    Text(message).font(.callout).foregroundStyle(.secondary)
+                }
+
+                Divider()
+                StreamsContent()
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .top)
         }
-        .padding(8)
         .sheet(isPresented: _showPairing.projectedValue) {
             PairingView(payload: daemon.status?.pairingPayload)
                 .frame(width: 460, height: 560)
@@ -2577,6 +2636,9 @@ struct NotificationsView: View {
         get { _replyText.wrappedValue }
         nonmutating set { _replyText.wrappedValue = newValue }
     }
+    /// Keys whose "Copy OTP" pill just showed "Copied"; reset after 1.5 s (Messages-page style).
+    private var _copied: State<Set<String>> = State(initialValue: [])
+    private var copied: Set<String> { _copied.wrappedValue }
 
     var body: some View {
         let all = daemon.recentNotifications
@@ -2663,6 +2725,15 @@ struct NotificationsView: View {
                     if note.isCall == true {
                         CallCardView(note: note, compact: true)
                     } else {
+                        if let code = OTPFinder.otp(in: note.body) {
+                            copyPill(note: note, code: code,
+                                     copied: copied, markCopied: { key in
+                                         _copied.wrappedValue.insert(key)
+                                         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                             _copied.wrappedValue.remove(key)
+                                         }
+                                     })
+                        }
                         if note.replyable {
                             Button("Reply") {
                                 replying = note
@@ -2731,6 +2802,29 @@ enum OTPFinder {
     static func copyToPasteboard(_ code: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(code, forType: .string)
+    }
+}
+
+/// The one-tap copy pill for a notification row that carries a one-time code: shows
+/// "Copy OTP" with the code beside it (same look as the Messages page), flips to
+/// "Copied ✓" for a moment, and copies with `OTPFinder`. It never opens the phone.
+private func copyPill(note: PhoneNotification, code: String, copied: Set<String>,
+                      markCopied: @escaping (String) -> Void) -> some View {
+    let done = copied.contains(note.key)
+    return HStack(spacing: 6) {
+        Image(systemName: done ? "checkmark" : "lock_shield")
+            .foregroundStyle(done ? Color.green : Color.accentColor)
+        Text(code).font(.caption).fontWeight(.semibold)
+        Button {
+            OTPFinder.copyToPasteboard(code)
+            markCopied(note.key)
+        } label: {
+            Label(done ? "Copied" : "Copy OTP",
+                  systemImage: done ? "checkmark" : "doc.on.doc")
+                .font(.caption2)
+        }
+        .buttonStyle(.bordered)
+        .tint(done ? .green : .accentColor)
     }
 }
 
@@ -3170,6 +3264,11 @@ struct SettingsView: View {
         get { _allTiles.wrappedValue }
         nonmutating set { _allTiles.wrappedValue = newValue }
     }
+    private var _appStreamOrientation: State<String> = State(initialValue: StreamHost.appStreamOrientation)
+    private var appStreamOrientation: String {
+        get { _appStreamOrientation.wrappedValue }
+        nonmutating set { _appStreamOrientation.wrappedValue = newValue }
+    }
     private var _error: State<String?> = State(initialValue: nil)
     private var error: String? {
         get { _error.wrappedValue }
@@ -3202,6 +3301,16 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
             Section("Experimental") {
+                Picker("Stream apps in", selection: _appStreamOrientation.projectedValue) {
+                    Text("Landscape (tablet size)").tag("landscape")
+                    Text("Portrait (phone shape)").tag("portrait")
+                }
+                .onChange(of: appStreamOrientation) { value in
+                    UserDefaults.standard.set(value, forKey: "appStreamOrientation")
+                }
+                Text("Shape of the virtual display new app streams run on. Landscape opens apps on a wide 1600×900 display (tablet proportions); portrait keeps the phone's own screen shape, so portrait-only apps stream tall. Applies to the next app you open — already-open stream windows keep their display. Screen share keeps its own resolution. Turn to portrait if an app shows nothing or misrenders on the wide display.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Toggle("Advertise every phone feature tile", isOn: _allTiles.projectedValue)
                     .onChange(of: allTiles) { on in
                         UserDefaults.standard.set(on, forKey: "allTiles")
@@ -3233,7 +3342,7 @@ struct SettingsView: View {
                 }
             }
             Section("This port") {
-                Text("Pairing, connection, notifications, clipboard, SMS, PC lock and hotspot are implemented. The phone shows tiles for PC lock, Hotspot, Clipboard sync, App streaming and Screen share / Mobile desktop; the *Streams* tab can start and close streams from the PC. Cross Control, phone-as-display and the virtual webcam are not part of this release; show their tiles with the switch above (their taps time out). Screen share streams with video and input verified on a device through the *Screen share* tile.")
+                Text("Pairing, connection, notifications, clipboard, SMS, PC lock and hotspot are implemented. The phone shows tiles for PC lock, Hotspot, Clipboard sync, App streaming and Screen share / Mobile desktop; the *Streams* section of the Phone page can start and close streams from the PC. Cross Control, phone-as-display and the virtual webcam are not part of this release; show their tiles with the switch above (their taps time out). Screen share streams with video and input verified on a device through the *Screen share* tile.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 Text("Bluetooth: desktop-side wake works. macOS cannot put custom service data in a BLE advertisement, so first-time pairing may need the phone's app in the foreground.")
@@ -3481,8 +3590,36 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
         var key: String { "\(userId)|\(pkg)" }
     }
 
+    /// Streams-grid sections. The phone's own app-stream picker shows Apps / Games / TV, but the
+    /// wire list carries no category (`pkg, name, userId, cmp, iconName` only), so sections are
+    /// matched client-side: Games via common game studios and game words, TV via the
+    /// video-streaming packages and a "tv" in the name, everything else under Apps.
+    enum AppKind { case game, tv, other }
+
+    static func classify(_ app: StreamApp) -> AppKind {
+        let n = app.name.lowercased()
+        let p = app.pkg.lowercased()
+        // TV / video-streaming apps (Google TV = com.google.android.videos, Prime Video = …avod…).
+        let tvPkgs = ["netflix", "in.startv.hotstar", "hotstar", "amazon.avod", "google.android.videos",
+                      "android.videos", "stremio", "sonyliv", "zee5", "jiocinema", "mxplayer",
+                      "mx.player", "voot", "tubi", "pluto", "disney", "hbo", "peacock", "airtel.xstream",
+                      "youtube.kids", "rabbittv"]
+        if tvPkgs.contains(where: p.contains) || n.contains("tv") { return .tv }
+        // Games: common studios plus the words that game titles and packages carry (any match),
+        // and only there — words a productivity app could share ("play", "go", "war") stay out.
+        let gameWords = ["game", "puzzle", "quiz", "brain", "sudoku", "chess", "ludo", "arcade",
+                         "wordle", "solitaire", "2048", "minesweeper", "crossword", "trivia",
+                         "stickman", "carrom", "checkers"]
+        let gamePkgs = ["easybrain", "supercell", "moonton", "playrix", "king.com", "miniclip",
+                        "roblox", "epicgames", "garena", "plarium", "voodoo.io", "nistgame",
+                        "zynga", "urn.globetrotter.games"]
+        if gamePkgs.contains(where: p.contains) || gameWords.contains(where: n.contains)
+            || gameWords.contains(where: p.contains) { return .game }
+        return .other
+    }
+
     private var started = false
-    /// The phone's apps, shown on the Streams tab.
+    /// The phone's apps, shown on the Phone page's Streams section.
     private(set) var apps: [StreamApp] = []
     /// Last time the PC asked the phone for the app list; the surfaces auto-request at most
     /// every 5 minutes so opening the panel is instant from the cache, not a refresh ritual.
@@ -3505,6 +3642,19 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
     // read of a String reference is worse-case benign (either nil or a whole SDP string).
     nonisolated(unsafe) static var lastOfferSDP: String?
     private var harnessView: WKWebView?
+
+    /// App streams' display shape (Settings). "portrait" = the pre-tablet behavior: the phone
+    /// builds each app display from its own screen size rotated to the app's declared
+    /// orientation, so portrait-only apps stream as a tall phone (610x1356 OBSERVED). Any
+    /// other value (default "landscape") asks via `supportCustomDisplay` for a wide 1600×900
+    /// display at 160 dpi instead, so the app runs on tablet-shaped virtual display. Never
+    /// applied to Screen share / Mobile desktop. Docs: app-streaming.md.
+    static var appStreamOrientation: String {
+        UserDefaults.standard.string(forKey: "appStreamOrientation") ?? "landscape"
+    }
+
+    /// The tablet-sized branch from the docs' `supportCustomDisplay` note (`requestStart`).
+    static var appStreamLandscape: Bool { appStreamOrientation != "portrait" }
 
     func start() {
         guard !started else { return }
@@ -3734,7 +3884,7 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
         objectWillChange.send()
     }
 
-    // MARK: PC-initiated streams (the Streams tab)
+    // MARK: PC-initiated streams (the Streams section of the Phone page)
 
     private func onService17(_ body: [String: Any]) {
         let cmd = StreamValue.int(body["cmd"]) ?? -1
@@ -3765,7 +3915,8 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
         sender().send(service: 17, payload: ["cmd": "send", "service": 17, "data": ["ver": "1", "cmd": 2]])
     }
 
-    /// Auto-request for the Streams page / panel: visible on open, but no more often than every
+    /// Auto-request for the Streams grid (Phone page / panel): visible on open, but no more
+    /// often than every
     /// 5 minutes (the cached list is displayed immediately in between).
     func requestAppsIfStale() {
         guard DaemonClient.shared.status?.connected == true else { return }
@@ -3831,9 +3982,9 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
         requestStart(pkg: app.pkg, cmp: app.cmp, userId: app.userId, shortcutId: nil, source: 0, name: app.name)
     }
 
-    /// Closed from the Streams tab; like a user-closed window this owes the phone a cmd 7.
+    /// Closed from the Streams grid; like a user-closed window this owes the phone a cmd 7.
     func closeStream(_ sid: Int64) {
-        closeSession(sid, why: "closed from the Streams tab", tellPhone: true)
+        closeSession(sid, why: "closed from the Streams grid", tellPhone: true)
     }
 
     var streamList: [(sid: Int64, title: String)] {
@@ -3966,6 +4117,18 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
             // JSON booleans, never 0/1: the phone's Gson would throw and the start dies silently.
             "supportCustomDisplay": false, "vrSupportUnfolded": false,
         ]
+    /// Tablet-sized streams (Settings): a portrait app would otherwise get the phone's own
+    /// portrait screen shape. `supportCustomDisplay` makes the phone use
+    /// `displayWidth`/`displayHeight` as given, so the app runs on a wide 16:9 virtual
+    /// display (~10 in wide at 160 dpi — tablet proportions) and the already-landscape
+    /// bound fits without scaling steps. Portrait is the old behavior (`supportCustomDisplay`
+    /// false), where the phone rotates its own screen size to the app's declared orientation.
+    /// Screen share always keeps its mirror geometry.
+        if !StreamHost.isViewPkg(pkg) && StreamHost.appStreamLandscape {
+            data["displayWidth"] = 1600
+            data["displayHeight"] = 900
+            data["supportCustomDisplay"] = true
+        }
         // `cmp` and `shortcutId` are echoed when the phone invited an app (docs: app streams
         // carry `cmp` when the PC's service 15 version is 10+; PC-initiated starts leave both out).
         if let cmp { data["cmp"] = cmp }

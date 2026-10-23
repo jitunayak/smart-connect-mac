@@ -10,6 +10,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The READM
 
 ### Added
 
+- macOS app: the **Streams app grid gets the phone-picker's sections** — Games, TV apps and Apps.
+  The svc 17 app list carries no category (only `pkg, name, userId, cmp, iconName`), so apps are
+  matched client-side: common game studios and game words (puzzle/quiz/brain/sudoku…) land in
+  Games, the video-streaming set (Netflix, Prime Video, Google TV, JioHotstar, Stremio…) and
+  anything with "tv" in the name land in TV apps, and the rest stay Apps — flat and header-free
+  when no game or TV app is installed. The Menu Streams and Apps from the phone sections show
+  the same sections, both places. A specific app you can't find is still one search away (the
+  search covers the whole list); classification flags can be shared on request.
+- macOS app: **tablet-sized app streams** — the stream host sends `cmd 1` with
+  `supportCustomDisplay: true` and a landscape 1600×900 display at 160 dpi, so the phone launches
+  each streamed app on a wide "tablet" virtual display instead of its own portrait screen shape
+  (portrait apps used to stream as a tall 610×1356 phone window no matter what bound `cmd 1`
+  advertised). The stream window follows the landscape video aspect; already-open streams keep
+  their display, Screen share keeps its mirror geometry. Setting: *Settings → Experimental →
+  Stream apps in* — **Landscape (tablet size)** (default) or **Portrait (phone shape)**, the
+  old behaviour; portrait is there for apps that misrender on the wide display. The phone's use
+  of the custom-display fields is documented
+  (docs/protocol/app-streaming.md) from phone-app reading — not yet verified on a device.
+- macOS app: **Copy OTP on notifications** — when a message (or any app) notification carries a
+  one-time code (`OTPFinder`: keyword within 40 chars of a 4-8 digit group, or a bare code), the
+  system banner gains a **Copy OTP** action as its first button; tapping it copies the code to the
+  Mac's pasteboard locally (the notification is not opened on the phone or marked handled) and a
+  short "OTP copied" banner confirms it. The notifications rows in the menu panel and the
+  Notifications page show the same Copy OTP pill (code beside it, ✓ Copied feedback) next to
+  Reply/Open, matching the existing Messages-page copy pill.
 - macOS app: a **menu-bar call pill** while the phone is ringing or in a call — a status-bar item
   (red Incoming / green phone glyph with a live timer, iOS's in-call pill) whose popover carries
   the caller's avatar, name, the dialer's detail line (caller ID) and a running timer, plus
@@ -99,6 +124,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The READM
   model, battery capsule), a segmented Phone/Streams/Notifications picker with icons, each section
   in a rounded card (prominent Connect/Disconnect, bordered stream start buttons, the existing
   streams and notifications list), and a plain-text Open/Quit footer. Panel width 360.
+- macOS app: the **Streams tab is merged into the Phone page** — the mirror tiles (Screen share /
+  Mobile desktop), running streams and the phone's app grid now sit on the Phone page below the
+  connection info, and the window's rail keeps *Phone, Notifications, Messages, Settings*; the
+  menu-bar panel picks Phone as the streaming section too (its picker has three segments) and
+  carries the Screen share / Desktop / Refresh row, running streams and the app grid. App icons
+  and the search stay as on the old Streams page.
+- macOS app: the Phone page's footer captions ("PC address…" and "Pairing QR is served…") are
+  gone — the PC's IP is an info tile in the status row (next to Battery / Wi-Fi / Bluetooth),
+  and *Mirror screen* / *Mobile desktop* carry the same icons as the panel's buttons.
+- macOS app: the Phone page's Streams section drops its headings (*Streams*, *Apps from the
+  phone*, *Running streams*) — the running-stream rows and the app grid follow the connection
+  info directly, with Refresh on the same row as the search field.
 
 ### Fixed
 

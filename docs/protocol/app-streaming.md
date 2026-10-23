@@ -23,7 +23,13 @@ JSON flows; the input mappings are ported; the answer keeps the phone's offer un
 [mirroring.md](mirroring.md#on-the-macos-port-the-host-role-is-filled-by-the-menu-bar-app) for
 why, and for the mDNS candidate handling). The tile is advertised by default on macOS and
 **verified on a device** (Screen share; app-stream invite → command 3 → command 4 → cmd 8
-state 1 with a display, video and input).
+state 1 with a display, video and input). App streams can run on a **landscape "tablet"
+display**: when *Settings → Experimental → Stream apps in* is **Landscape (tablet size)** (the
+default), the macOS host sends `cmd 1` with `supportCustomDisplay: true` and a
+`displayWidth`/`displayHeight` of 1600×900 at 160 dpi, so the phone launches the app on a wide
+virtual display instead of its own portrait screen shape; the window follows the video's
+landscape aspect. **Portrait (phone shape)** keeps the pre-tablet behaviour (no
+`supportCustomDisplay`).
 
 ## Overview
 
