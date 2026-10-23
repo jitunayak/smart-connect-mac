@@ -342,7 +342,9 @@ final class CallPanelController: NSObject {
     }
 
     func refresh() {
-        guard let call = DaemonClient.shared.ongoingCall else {
+        // Ringing wins a display: the incoming-call card is what the phone is doing right now.
+        guard let call = DaemonClient.shared.ringingCall
+                ?? DaemonClient.shared.ongoingCall else {
             dismiss()
             return
         }
@@ -356,7 +358,7 @@ final class CallPanelController: NSObject {
         shownKey = call.key
         lastShown = call
         if panel == nil {
-            let frame = NSRect(x: 0, y: 0, width: 340, height: 66)
+            let frame = NSRect(x: 0, y: 0, width: 372, height: 78)
             let p = NSPanel(contentRect: frame,
                             styleMask: [.borderless, .nonactivatingPanel],
                             backing: .buffered, defer: false)
@@ -375,7 +377,7 @@ final class CallPanelController: NSObject {
         )
         panel?.contentView = hosting
         placeAndShow()
-        NSLog("SmartConnect: call: persistent call bar shown for \(call.key)")
+        NSLog("SmartConnect: call: call card shown for \(call.key) (\(CallUX.isRinging(call) ? "ringing" : "ongoing"))")
     }
 
     private func placeAndShow() {
@@ -394,7 +396,7 @@ final class CallPanelController: NSObject {
         panel = nil
         shownKey = nil
         lastShown = nil
-        NSLog("SmartConnect: call: persistent call bar hidden (call over)")
+        NSLog("SmartConnect: call: call card hidden (no ringing or ongoing call)")
     }
 }
 
@@ -403,42 +405,101 @@ private struct CallPanelContent: View {
     private var daemon: DaemonClient { _daemon.wrappedValue }
 
     var body: some View {
-        if let call = daemon.ongoingCall {
-            let start = daemon.ongoingCallSince ?? Date()
-            HStack(spacing: 12) {
-                CallAvatar(note: call, size: 42)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(call.title)
-                        .font(.system(.body, design: .default, weight: .semibold))
-                        .lineLimit(1)
-                    TimelineView(.periodic(from: start, by: 1)) { _ in
-                        let elapsed = max(0, Int(Date().timeIntervalSince(start)))
-                        Text("Ongoing call · \(elapsed / 60):\(String(format: "%02d", elapsed % 60))")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                Spacer(minLength: 8)
-                if let end = CallUX.first(call, "hang") {
-                    Button {
-                        daemon.runAction(key: call.key, service: call.service, actionID: end.id, mark: false)
-                    } label: {
-                        Image(systemName: "phone.down.fill")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .frame(width: 38, height: 38)
-                            .background(Circle().fill(Color.red))
-                            .contentShape(Circle())
-                    }
-                    .buttonStyle(.plain)
+        if let ringing = daemon.ringingCall {
+            ringingCard(ringing)
+        } else if let call = daemon.ongoingCall {
+            ongoingCard(call)
+        }
+    }
+
+    /// The iPhone incoming-call banner: avatar, name, and the red Decline / green Accept round
+    /// buttons at the right.
+    private func ringingCard(_ call: PhoneNotification) -> some View {
+        HStack(spacing: 12) {
+            CallAvatar(note: call, size: 44)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(call.title)
+                    .font(.system(.body, design: .default, weight: .semibold))
+                    .lineLimit(1)
+                HStack(spacing: 4) {
+                    Image(systemName: "phone.badge.waveform")
+                        .font(.caption2)
+                    Text("Incoming call")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(RoundedRectangle(cornerRadius: 22, style: .continuous).fill(.ultraThinMaterial))
-            .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08)))
+            Spacer(minLength: 8)
+            callButton(call, CallUX.first(call, "decline"), color: .red, icon: "phone.down.fill")
+            callButton(call, CallUX.first(call, "accept"), color: .green, icon: "phone.fill")
+            if let silence = CallUX.first(call, "silence") {
+                Button("Silence") {
+                    daemon.runAction(key: call.key, service: call.service, actionID: silence.id, mark: false)
+                }
+                .font(.caption2)
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+            }
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 13)
+        .background(CallCardBackground(edgeColor: .green))
+    }
+
+    /// The ongoing bar: avatar, name, live duration, red End circle.
+    private func ongoingCard(_ call: PhoneNotification) -> some View {
+        let start = daemon.ongoingCallSince ?? Date()
+        return HStack(spacing: 12) {
+            CallAvatar(note: call, size: 42)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(call.title)
+                    .font(.system(.body, design: .default, weight: .semibold))
+                    .lineLimit(1)
+                TimelineView(.periodic(from: start, by: 1)) { _ in
+                    let elapsed = max(0, Int(Date().timeIntervalSince(start)))
+                    Text("Ongoing call · \(elapsed / 60):\(String(format: "%02d", elapsed % 60))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 8)
+            callButton(call, CallUX.first(call, "hang"), color: .red, icon: "phone.down.fill")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 13)
+        .background(CallCardBackground(edgeColor: .secondary))
+    }
+
+    /// The round phone button (nil action → no button; unknown dialer labels fall back in rows).
+    @ViewBuilder
+    private func callButton(_ call: PhoneNotification, _ action: NotificationAction?,
+                            color: Color, icon: String) -> some View {
+        if let action {
+            Button {
+                daemon.runAction(key: call.key, service: call.service, actionID: action.id, mark: false)
+            } label: {
+                Image(systemName: icon)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 44, height: 44)
+                    .background(Circle().fill(color))
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+        }
+    }
+}
+
+/// Vibrancy background with the colored edge the call banners carry.
+private struct CallCardBackground: View {
+    let edgeColor: Color
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 26, style: .continuous)
+            .fill(.ultraThinMaterial)
+            .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .strokeBorder(edgeColor.opacity(0.55), lineWidth: 1))
+            .shadow(color: .black.opacity(0.18), radius: 10, y: 3)
     }
 }
 
@@ -848,6 +909,13 @@ final class NotificationBridge: NSObject {
             picture: frame.picture,
             icon: frame.icon
         ))
+        // Calls skip the plain UN banner: their notification is the floating iPhone-style call
+        // card (Avatar + round Accept/Decline circles) shown by the call panel, driven purely
+        // by `ringingCall`/`ongoingCall` state above.
+        if frame.isCall == true {
+            NSLog("SmartConnect: notifications: \(key) is a call: the call card handles it (no UN banner)")
+            return
+        }
         let content = UNMutableNotificationContent()
         content.title = title
         content.subtitle = app
