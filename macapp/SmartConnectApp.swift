@@ -32,6 +32,9 @@ enum Paths {
     static let logs = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("Logs/SmartConnect", isDirectory: true)
     static let daemonLog = logs.appendingPathComponent("smartconnectd.log")
+    /// Cached phone app list (service 17 `cmd 1`), so the Streams surfaces open instantly even
+    /// before the phone answers the fresh request.
+    static let appsCache = cache.appendingPathComponent("apps-cache.json")
 }
 
 // MARK: - UNIX socket line I/O
@@ -583,9 +586,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hosting = NSHostingController(rootView: root)
         let window = NSWindow(contentViewController: hosting)
         window.title = "SmartConnect"
-        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        // Glass look: the window is fully transparent and the SwiftUI content draws the
+        // vibrancy material edge to edge, including under the title bar.
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.backgroundColor = .clear
+        window.isOpaque = false
         window.isReleasedWhenClosed = false
-        window.setContentSize(NSSize(width: 900, height: 560))
+        window.setContentSize(NSSize(width: 920, height: 610))
         window.contentMinSize = NSSize(width: 640, height: 460)
         window.center()
         window.setFrameAutosaveName("main")
@@ -736,9 +745,9 @@ struct MenuContent: View {
                 default: MenuNotificationsSection()
                 }
             }
-            .padding(10)
-            .background(RoundedRectangle(cornerRadius: 12).fill(Color.primary.opacity(0.045)))
-            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.primary.opacity(0.07)))
+            .padding(12)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.primary.opacity(0.07)))
 
             HStack(spacing: 8) {
                 Button {
@@ -852,7 +861,6 @@ struct MenuStreamsSection: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
             .disabled(daemon.status?.connected != true)
-
             ForEach(host.streamList, id: \.sid) { s in
                 HStack(spacing: 8) {
                     Image(systemName: "rectangle.inset.bottomleft.filled").foregroundStyle(.secondary)
@@ -903,6 +911,7 @@ struct MenuStreamsSection: View {
                 .frame(maxHeight: 320)
             }
         }
+        .onAppear { host.requestAppsIfStale() }
     }
 }
 
@@ -1227,14 +1236,15 @@ struct MainWindow: View {
     private var _section: State<Int> = State(initialValue: 0)
 
     var body: some View {
-        // Phone-Link-style layout: the dummy phone tops a narrow left rail, the feature pages sit
-        // under it as a vertical list, and the chosen page fills the right side.
+        // Phone-Link-style layout in a glass window: vibrancy draws under everything (including
+        // the hidden title bar), the rail gets a slightly denser material, and the pages keep
+        // comfortable padding.
         HStack(alignment: .top, spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
                 Edge70PhoneView()
                     .frame(maxWidth: .infinity) // center the phone in the rail like Phone Link
-                    .padding(.top, 24)
-                    .padding(.bottom, 14)
+                    .padding(.top, 42) // clears the traffic lights (full-size content view)
+                    .padding(.bottom, 18)
                 navItem(0, icon: "iphone", label: "Phone")
                 navItem(1, icon: "play.rectangle", label: "Streams")
                 navItem(2, icon: "bell", label: "Notifications")
@@ -1242,9 +1252,12 @@ struct MainWindow: View {
                 navItem(4, icon: "gearshape", label: "Settings")
                 Spacer()
             }
-            .frame(width: 224)
+            .frame(width: 232)
+            .frame(maxHeight: .infinity, alignment: .top)
+            .background(.thinMaterial)
+            .padding(.bottom, 4)
 
-            Divider()
+            Divider().opacity(0.25)
 
             Group {
                 switch _section.wrappedValue {
@@ -1255,9 +1268,13 @@ struct MainWindow: View {
                 default: SettingsView()
                 }
             }
+            .padding(.top, 34) // clearance under the traffic lights
+            .padding(.horizontal, 22)
+            .padding(.vertical, 14)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
-        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.ultraThinMaterial)
     }
 
     private func navItem(_ tag: Int, icon: String, label: String) -> some View {
@@ -1386,6 +1403,7 @@ struct StreamsContent: View {
             .padding(.bottom, 12)
         }
         .padding(8)
+        .onAppear { host.requestAppsIfStale() }
     }
 }
 
@@ -2535,6 +2553,9 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
     private var started = false
     /// The phone's apps, shown on the Streams tab.
     private(set) var apps: [StreamApp] = []
+    /// Last time the PC asked the phone for the app list; the surfaces auto-request at most
+    /// every 5 minutes so opening the panel is instant from the cache, not a refresh ritual.
+    private(set) var lastAppsRequest: Date?
     private var sessions: [Int64: StreamSession] = [:]
     private var lastHb: Date?
     /// The phone's desktop resolution, sent in its Screen-share/Mobile-desktop cmd 0 (view 2).
@@ -2555,6 +2576,11 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
         guard !started else { return }
         started = true
         instanceId = StreamHost.loadInstanceId()
+        // Show the cached app list immediately; the fresh list replaces it when the phone answers.
+        apps = StreamHost.loadAppsCache()
+        if !apps.isEmpty {
+            NSLog("SmartConnect: stream: showing \(apps.count) cached apps before the fresh list arrives")
+        }
         watchLoop()
         heartbeatLoop()
         if CommandLine.arguments.contains("--webrtc-sdp-harness") {
@@ -2773,14 +2799,52 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
             }
         }
         apps = out.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        StreamHost.saveAppsCache(apps)
         notify()
     }
 
     /// The phone sends its app list on every connection; `cmd 2` asks for it again.
     func requestApps() {
         guard DaemonClient.shared.status?.connected == true else { return }
+        lastAppsRequest = Date.now
         NSLog("SmartConnect: stream: asking the phone for its app list again (svc 17 cmd 2)")
         sender().send(service: 17, payload: ["cmd": "send", "service": 17, "data": ["ver": "1", "cmd": 2]])
+    }
+
+    /// Auto-request for the Streams page / panel: visible on open, but no more often than every
+    /// 5 minutes (the cached list is displayed immediately in between).
+    func requestAppsIfStale() {
+        guard DaemonClient.shared.status?.connected == true else { return }
+        if apps.isEmpty || Date.now.timeIntervalSince(lastAppsRequest ?? .distantPast) > 300 {
+            requestApps()
+        }
+    }
+
+    /// The apps cache lives in the user cache dir, keyed the same way the rows render
+    /// (`pkg`, `name`, `userId`, `cmp`, `iconName`, `work`); icons resolve from the daemon's
+    /// icon cache so nothing binary goes in here.
+    private static func saveAppsCache(_ apps: [StreamApp]) {
+        let entries: [[String: Any]] = apps.map {
+            ["pkg": $0.pkg, "name": $0.name, "userId": $0.userId, "cmp": $0.cmp, "iconName": $0.iconName, "work": $0.work]
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: entries) else { return }
+        try? data.write(to: Paths.appsCache, options: .atomic)
+    }
+
+    private static func loadAppsCache() -> [StreamApp] {
+        guard let data = try? Data(contentsOf: Paths.appsCache),
+              let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
+        }
+        return raw.compactMap { entry in
+            guard let pkg = entry["pkg"] as? String, !pkg.isEmpty else { return nil }
+            return StreamApp(pkg: pkg,
+                             name: entry["name"] as? String ?? pkg,
+                             userId: Int64((entry["userId"] as? Int) ?? 0),
+                             cmp: entry["cmp"] as? String ?? "",
+                             iconName: entry["iconName"] as? String ?? "",
+                             work: (entry["work"] as? Bool) ?? false)
+        }
     }
 
     /// Starts a whole-phone view from the PC: both the svc 1 `cmd 1` (ping `reply: 0` — an idle

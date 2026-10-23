@@ -10,6 +10,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The READM
 
 ### Added
 
+- macOS app: the phone's app list is cached (`~/Library/Caches/SmartConnect/apps-cache.json`,
+  written on every fresh service 17 `cmd 1`) and is shown instantly at launch and whenever a
+  Streams surface opens — the panel no longer needs a manual Refresh before anything shows. Each
+  surface also auto-requests a fresh list at most every 5 minutes while the phone is connected
+  (plus the manual Refresh button), and the fresh answer replaces the cache silently. Verified:
+  193 apps pooled into the cache; a relaunch logs "showing 193 cached apps before the fresh list
+  arrives" (OBSERVED).
 - macOS app: the Notifications page (window and menu-bar panel) keeps older notifications instead
   of rotating them out — the bridge stores up to 200 and the merged list shows up to 300, still
   de-duplicated by key. Notifications the user acted on (Open on phone, a Reply, an action button
