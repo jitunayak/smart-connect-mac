@@ -1410,7 +1410,13 @@ extension NotificationBridge: UNUserNotificationCenterDelegate {
         let isCall = info["isCall"] as? Bool == true
         let action = response.actionIdentifier
         DispatchQueue.main.async {
-            if action == "reply", let text = (response as? UNTextInputNotificationResponse)?.userText, !text.isEmpty {
+            if let update = info["updateURL"] as? String, action == UNNotificationDefaultActionIdentifier,
+               let url = URL(string: update) {
+                // The update notice is this app's own (see `UpdateChecker`), not a mirrored phone
+                // notification: a click opens the release page here and touches nothing on the
+                // phone — it must be handled before the notification branches below.
+                NSWorkspace.shared.open(url)
+            } else if action == "reply", let text = (response as? UNTextInputNotificationResponse)?.userText, !text.isEmpty {
                 DaemonClient.shared.reply(key: key, text: text)
                 DaemonClient.shared.markHandled(key: key)
             } else if action == "copyotp", let otp = info["otp"] as? String, !otp.isEmpty {
@@ -1499,6 +1505,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // The menu-bar in-call pill owns the same states (it shows nothing in the menu bar
         // until a call is ringing or ongoing).
         CallMenuBarController.shared.start()
+        // A newer release on GitHub announces itself once per tag: same silent check the
+        // Updates page re-runs by hand.
+        UpdateChecker.shared.checkOnLaunch()
+        // Dev switch: `open -a SmartConnect --args --self-test-update` offers this very build as
+        // a release (its own disk image), to exercise the download → replace → restart path
+        // without publishing one.
+        if CommandLine.arguments.contains("--self-test-update") {
+            UpdateChecker.shared.runSelfTest()
+        }
         _ = ensureDaemonRunning()
 
         // A menu-bar-only app with no window is confusing on first launch. Show the main window
@@ -3348,7 +3363,534 @@ struct MessagesView: View {
     }
 }
 
+// MARK: - Update checker
+
+/// Looks for a newer build of this project among its GitHub releases. One silent check runs a
+/// few seconds after launch and, when the tag is new, announces itself with a plain macOS
+/// notification whose click opens the release page; Settings ✓ *Updates* shows the same state,
+/// re-checks on demand, and can **download the release's disk image and install it** in place
+/// (replace this bundle, restart the app) — see `install` below. The release page stays one click
+/// away for whoever would rather update by hand.
+@MainActor
+final class UpdateChecker: ObservableObject {
+    static let shared = UpdateChecker()
+
+    /// `releases/latest` never returns drafts or pre-releases, so a noisy pre-release is not
+    /// announced as an update.
+    private static let api = "https://api.github.com/repos/jitunayak/smart-connect-mac/releases/latest"
+    /// What the browser opens when there is no release to point at (or the tag's own page when
+    /// GitHub gives us one, which is what `Release.url` carries).
+    static let releasePage = "https://github.com/jitunayak/smart-connect-mac/releases/latest"
+    private static let announcedKey = "updateAnnouncedTag"
+    private static let updateDirName = "smartconnect-update"
+
+    /// The file the release ships to install from: currently `SmartConnect-<tag>.dmg`, chosen from
+    /// the release's assets (first disk image, else the first asset at all).
+    struct Asset: Equatable {
+        var url: String
+        var name: String
+        var size: Int64
+    }
+
+    struct Release {
+        var tag: String
+        var name: String?
+        var url: String
+        var published: String?
+        var asset: Asset?
+    }
+
+    enum Phase: Equatable {
+        case idle
+        case checking
+        case current
+        case available
+        case failed(String)
+    }
+
+    /// The in-app install, from the button press until this copy hands itself over. The steps
+    /// after `.installing` happen in `update.sh`, which waits for this process to exit before it
+    /// swaps the bundle and starts the new copy — so `.installing` is the last state the window
+    /// ever shows.
+    enum Install: Equatable {
+        case idle
+        case downloading
+        case installing
+        case failed(String)
+    }
+
+    @Published private(set) var phase: Phase = .idle
+    @Published private(set) var release: Release?
+    @Published private(set) var checkedAt: Date?
+    @Published private(set) var install: Install = .idle
+    private var launchScheduled = false
+    private var installTask: Task<Void, Never>?
+    /// Set by `--self-test-update`: the made-up release stands in for a real one, so the launch
+    /// check and the button on the Updates page leave it alone instead of overwriting it.
+    private var selfTest = false
+
+    /// From the bundle the build stamps (`Info.plist`, `CFBundleShortVersionString`).
+    static var version: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0" }
+
+    /// Is a newer release known? `phase` is only `.available` after a tag compared newer.
+    var available: Bool { phase == .available }
+
+    /// The install failed somewhere the window is still alive (the steps after `.installing`
+    /// report through the updater's own notification instead).
+    var installFailed: Bool {
+        if case .failed = install { return true }
+        return false
+    }
+
+    var status: String {
+        switch phase {
+        case .idle:
+            return "Not checked yet."
+        case .checking:
+            return "Checking the project's releases on GitHub …"
+        case .current:
+            let when = checkedAt.map { " (checked \(Self.dateFmt.string(from: $0)))" } ?? ""
+            return "Version \(Self.version) is up to date\(when)."
+        case .available:
+            guard let release else { return "A newer release is available." }
+            var parts = [release.tag]
+            if let name = release.name, !name.isEmpty { parts.append("— \(name)") }
+            parts.append("your copy is \(Self.version)")
+            if let at = release.published.flatMap({ Self.iso.date(from: $0) }) {
+                parts.append("published \(Self.dateFmt.string(from: at))")
+            }
+            return parts.joined(separator: " ") + "."
+        case .failed(let why):
+            return "Could not check for updates: \(why)."
+        }
+    }
+
+    private static let dateFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f
+    }()
+
+    /// GitHub stamps releases with RFC 3339 (`2025-11-02T09:12:34Z`).
+    private static let iso: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    /// The launch-time check: scheduled once, a few seconds in, and the only path that
+    /// announces anything (a check from Settings reports through the Settings page instead).
+    func checkOnLaunch() {
+        guard !launchScheduled else { return }
+        launchScheduled = true
+        Task {
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            await run(announce: true)
+        }
+    }
+
+    /// What Settings calls: this batch's phase and status are the answer, nothing is posted.
+    func check() async {
+        await run(announce: false)
+    }
+
+    private func run(announce: Bool) async {
+        guard phase != .checking, !selfTest else { return } // one request at a time against GitHub's rate limit
+        phase = .checking
+        do {
+            let release = try await Self.fetch()
+            if Self.isNewer(release.tag, than: Self.version) {
+                self.release = release
+                checkedAt = Date()
+                phase = .available
+                if announce { Self.announce(release) }
+            } else {
+                self.release = release
+                checkedAt = Date()
+                phase = .current
+            }
+        } catch let e as UpdateError {
+            phase = .failed(e.message)
+        } catch {
+            phase = .failed((error as? URLError)?.code == .notConnectedToInternet
+                            ? "this Mac is offline" : error.localizedDescription)
+        }
+    }
+
+    private struct UpdateError: LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
+    }
+
+    private struct Payload: Decodable {
+        var tag_name: String
+        var html_url: String?
+        var name: String?
+        var published_at: String?
+        var assets: [AssetPayload]?
+    }
+
+    private struct AssetPayload: Decodable {
+        var name: String
+        var browser_download_url: String
+        var size: Int64?
+        var content_type: String?
+    }
+
+    /// The disk image to install from: releases ship `SmartConnect-<tag>.dmg`, so a `.dmg` asset
+    /// wins outright, and any other first asset stands in if the naming ever changes. An asset-less
+    /// release (a source-only tag) leaves `asset` nil: the download button disappears and only the
+    /// release page is offered.
+    private static func asset(from assets: [AssetPayload]?) -> Asset? {
+        let list = assets ?? []
+        let image = list.first { $0.name.lowercased().hasSuffix(".dmg") }
+            ?? list.first { $0.content_type == "application/x-apple-diskimage" }
+            ?? list.first
+        guard let image else { return nil }
+        return Asset(url: image.browser_download_url, name: image.name, size: image.size ?? 0)
+    }
+
+    private static func fetch() async throws -> Release {
+        var req = URLRequest(url: URL(string: api)!)
+        req.timeoutInterval = 15
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("SmartConnect/\(version) (macOS)", forHTTPHeaderField: "User-Agent")
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard let http = response as? HTTPURLResponse else {
+            throw UpdateError(message: "GitHub sent no reply")
+        }
+        switch http.statusCode {
+        case 200: break
+        case 404: throw UpdateError(message: "the project has no published release yet")
+        case 403, 429: throw UpdateError(message: "GitHub is rate-limiting update checks, try later")
+        default: throw UpdateError(message: "GitHub answered HTTP \(http.statusCode)")
+        }
+        let p = try JSONDecoder().decode(Payload.self, from: data)
+        return Release(tag: p.tag_name, name: p.name, url: p.html_url ?? releasePage,
+                       published: p.published_at, asset: asset(from: p.assets))
+    }
+
+    /// At most one announcement per release: the tag that was already announced is remembered
+    /// across launches, so opening the app tomorrow stays quiet about the same version.
+    private static func announce(_ release: Release) {
+        let defaults = UserDefaults.standard
+        guard defaults.string(forKey: announcedKey) != release.tag else { return }
+        defaults.set(release.tag, forKey: announcedKey)
+        let content = UNMutableNotificationContent()
+        content.title = "SmartConnect \(release.tag) is available"
+        content.body = "You have \(version). Settings → Updates has the details."
+        content.sound = .default
+        content.userInfo = ["updateURL": release.url]
+        let request = UNNotificationRequest(identifier: "update-available", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+        NSLog("SmartConnect: updates: announcing \(release.tag) (you have \(version))")
+    }
+
+    // MARK: install
+
+    /// The step to show under the button (nil while nothing is in flight): downloads report
+    /// progress by name, and any later failure — including one the installer script runs *after*
+    /// the window is gone — comes back as text, not silently.
+    var installStatus: String? {
+        switch install {
+        case .idle: return nil
+        case .downloading:
+            return "Downloading \(release?.asset?.name ?? "the update") …"
+        case .installing:
+            return "Replacing this copy — SmartConnect restarts when it is done."
+        case .failed(let why):
+            return why
+        }
+    }
+
+    /// Downloads the release's disk image, then hands the replacing to `update.sh`, which waits
+    /// for this process to exit before it touches the bundle (a running app can't be swapped
+    /// under itself). The replacement and the restart happen outside the app, so nothing in the
+    /// window after `.installing` matters — the next launch is the update.
+    func downloadAndInstall() {
+        guard install == .idle, phase == .available else { return }
+        guard let asset = release?.asset else {
+            install = .failed("this release ships no disk image — open the release page instead")
+            return
+        }
+        if Bundle.main.bundlePath.hasPrefix("/Volumes/") {
+            install = .failed("this copy runs from a mounted image: copy it somewhere you can write first, then update there")
+            return
+        }
+        install = .downloading
+        installTask = Task { await self.perform(asset) }
+    }
+
+    /// Gives up on a download that is still in flight; nothing has been touched on disk yet.
+    func cancelInstall() {
+        guard case .downloading = install else { return }
+        installTask?.cancel()
+        install = .idle
+    }
+
+    /// After a failure: back to the button, so the download can be tried again.
+    func retryInstall() {
+        guard case .failed = install else { return }
+        install = .idle
+    }
+
+    private func perform(_ asset: Asset) async {
+        defer { installTask = nil }
+        do {
+            let dmg = try await self.fetch(asset)
+            guard !Task.isCancelled else { install = .idle; return }
+            install = .installing
+            try Self.handOff(dmg: dmg)
+            NSLog("SmartConnect: updates: installer started for \(release?.tag ?? "the update")")
+            // One beat so the child is well on its way before this process — and its control
+            // sockets, which the script's wait is really about — are gone.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { NSApp.terminate(nil) }
+        } catch is CancellationError {
+            install = .idle
+        } catch let e as UpdateError {
+            install = .failed(e.message)
+        } catch {
+            install = .failed((error as? URLError)?.code == .notConnectedToInternet
+                              ? "this Mac went offline mid-download"
+                              : error.localizedDescription)
+        }
+    }
+
+    /// The release asset as a local disk image in the update folder. A `file://` asset (the
+    /// self-test below) is copied rather than fetched; both paths end with the byte count the
+    /// release promised, so a truncated download never reaches the installer.
+    private func fetch(_ asset: Asset) async throws -> URL {
+        guard let url = URL(string: asset.url) else {
+            throw UpdateError(message: "the release's download link is invalid")
+        }
+        if url.isFileURL {
+            let folder = try Self.updateFolder()
+            let dest = folder.appendingPathComponent((asset.name as NSString).lastPathComponent)
+            try? FileManager.default.removeItem(at: dest)
+            do { try FileManager.default.copyItem(at: url, to: dest) }
+            catch { throw UpdateError(message: "could not copy \(asset.name) — \(error.localizedDescription)") }
+            return try Self.check(dest, asset)
+        }
+        let (temp, response) = try await URLSession.shared.download(from: url)
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            throw UpdateError(message: "the download server answered HTTP \(http.statusCode)")
+        }
+        let folder = try Self.updateFolder()
+        let dest = folder.appendingPathComponent((asset.name as NSString).lastPathComponent)
+        try? FileManager.default.removeItem(at: dest)
+        do {
+            try FileManager.default.moveItem(at: temp, to: dest)
+        } catch {
+            // Temp and cache can sit on different volumes (FileVault/container joining).
+            do {
+                try FileManager.default.copyItem(at: temp, to: dest)
+                try? FileManager.default.removeItem(at: temp)
+            } catch {
+                throw UpdateError(message: "could not keep the download — \(error.localizedDescription)")
+            }
+        }
+        return try Self.check(dest, asset)
+    }
+
+    private static func updateFolder() throws -> URL {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent(updateDirName, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder
+    }
+
+    /// Keep only a download of exactly the size the release advertised (0 = unchecked).
+    private static func check(_ file: URL, _ asset: Asset) throws -> URL {
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: file.path))?[.size] as? Int64
+        guard let bytes, bytes > 0 else { throw UpdateError(message: "the download came back empty") }
+        if asset.size > 0, bytes != asset.size {
+            throw UpdateError(message: "the download is \(bytes) bytes where the release says \(asset.size) — it is truncated, try again")
+        }
+        return file
+    }
+
+    /// Runs the installer next to the app's own state and log files. It waits for us, mounts the
+    /// image, stages the new bundle beside the old one, swaps, drops the quarantine the download
+    /// carries and starts the new copy. Where this user can't write the folder the app lives in,
+    /// the same script runs through one administrator prompt (its uid argument makes it start the
+    /// new copy back in this login session, not as root).
+    private static func handOff(dmg: URL) throws {
+        let support = Paths.appSupport
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let script = support.appendingPathComponent("update.sh")
+        try installScript.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let destination = Bundle.main.bundleURL
+        let arguments = [
+            String(ProcessInfo.processInfo.processIdentifier),
+            destination.lastPathComponent,
+            destination.path,
+            dmg.path,
+            String(getuid())
+        ]
+        let log = support.appendingPathComponent("update.log")
+        if FileManager.default.isWritableFile(atPath: destination.deletingLastPathComponent().path) {
+            try spawn(executable: "/bin/bash", arguments: [script.path] + arguments, log: log)
+        } else {
+            let command = (["/bin/bash", script.path] + arguments)
+                .map(quote).joined(separator: " ")
+            try spawn(executable: "/usr/bin/osascript",
+                      arguments: ["-e", "on run argv",
+                                  "-e", "do shell script (item 1 of argv) with administrator privileges",
+                                  "-e", "end run", command],
+                      log: log)
+        }
+    }
+
+    private static func spawn(executable: String, arguments: [String], log: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        var handle: FileHandle?
+        if FileManager.default.createFile(atPath: log.path, contents: nil),
+           let opened = try? FileHandle(forWritingTo: log) {
+            opened.seekToEndOfFile()
+            handle = opened
+        }
+        process.standardOutput = handle
+        process.standardError = handle
+        try process.run()
+        try? handle?.close() // the child keeps its own descriptor; the pipe to it stays open
+    }
+
+    /// Single-quote wrapping that survives spaces, quotes and `$` in every path involved.
+    private static func quote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// The installer. It is a file rather than a Swift call on purpose: everything after the
+    /// handover must keep working with this process gone (and possibly running as root). Failures
+    /// are written to `<state folder>/update.log` **and** pushed as a macOS notification, since no
+    /// window is left to show them.
+    private static let installScript = """
+    #!/bin/bash
+    # SmartConnect's updater; started by the app (UpdateChecker.handOff).
+    #   $1 pid of the app that started us     $2 name of the bundle inside the image
+    #   $3 path of the installed bundle        $4 path of the release's disk image
+    #   $5 uid of the user who ran the app
+    set -u
+    pid="$1"; name="$2"; dest="$3"; img="$4"; uid="$5"
+    TAG="SmartConnect updater"
+
+    # No window of ours is running when something here goes wrong, so a failure is logged *and*
+    # pushed as a notification in the login session (this script may be running as root).
+    notify() {
+        if [ "$(id -u)" -eq 0 ]; then
+            launchctl asuser "$uid" osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' -e 'end run' "$1" "$2" >/dev/null 2>&1 || true
+        else
+            osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' -e 'end run' "$1" "$2" >/dev/null 2>&1 || true
+        fi
+    }
+
+    fail() {
+        echo "$TAG: failed: $1"
+        notify "$TAG" "Update failed: $1"
+        exit 1
+    }
+
+    echo "$TAG: waiting for the running copy (pid $pid) to exit"
+    for _ in $(seq 1 240); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
+    kill -0 "$pid" 2>/dev/null && fail "gave up waiting for the running copy to exit"
+
+    mnt="$(mktemp -d /tmp/smartconnect-update.XXXXXX)" || fail "no temporary folder for the image"
+    hdiutil attach "$img" -nobrowse -readonly -mountpoint "$mnt" -quiet || fail "could not open $img"
+    trap 'hdiutil detach "$mnt" -quiet 2>/dev/null || true' EXIT
+
+    src="$mnt/$name"
+    [ -d "$src" ] || fail "the image holds no $name"
+
+    stage="$dest.updating.$$"
+    rm -rf "$stage"
+    ditto "$src" "$stage" || { rm -rf "$stage"; fail "could not copy the new version aside"; }
+    rm -rf "$dest" || { rm -rf "$stage"; fail "$dest is not writable"; }
+    mv "$stage" "$dest" || { rm -rf "$stage"; fail "could not swap the new version in"; }
+    xattr -dr com.apple.quarantine "$dest" 2>/dev/null || true
+
+    ver="$(defaults read "$dest/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo '?')"
+    echo "$TAG: installed $ver at $dest"
+    if [ "$(id -u)" -eq 0 ]; then
+        launchctl asuser "$uid" open -n "$dest" 2>/dev/null || fail "installed as root, but could not start it in your session"
+    else
+        open -n "$dest" || fail "installed, but could not start it"
+    fi
+    echo "$TAG: done"
+    """
+
+    /// `--self-test-update`: puts the copy that is running through a disk image of itself and
+    /// offers it as a release, so download → replace → restart can be exercised end to end
+    /// without publishing anything (it installs exactly the bits already running). The image is
+    /// built outside the bundle, so it can't be staged over itself.
+    func runSelfTest() {
+        selfTest = true
+        Task {
+            let dmg = FileManager.default.temporaryDirectory
+                .appendingPathComponent("SmartConnect-\(Self.version)-selftest.dmg")
+            do { try? FileManager.default.removeItem(at: dmg) } // hdiutil refuses to overwrite
+            guard await Self.run("/usr/bin/hdiutil",
+                                 ["create", "-volname", "SmartConnect",
+                                  "-srcfolder", Bundle.main.bundlePath, "-ov", "-format", "UDZO",
+                                  dmg.path]) else {
+                phase = .failed("self-test: could not build a disk image of this copy")
+                return
+            }
+            let size = (try? FileManager.default.attributesOfItem(atPath: dmg.path))?[.size] as? Int64 ?? 0
+            release = Release(tag: "v\(Self.version)+selftest", name: "Self-test image",
+                              url: Self.releasePage, published: nil,
+                              asset: Asset(url: dmg.absoluteString, name: dmg.lastPathComponent,
+                                           size: size))
+            phase = .available
+            checkedAt = Date()
+            install = .idle
+            NSLog("SmartConnect: updates: self-test ready (\(dmg.path), \(size) bytes)")
+        }
+    }
+
+    /// One detached command, answered when it exits; output goes nowhere (hdiutil, that is fine).
+    private static func run(_ executable: String, _ arguments: [String]) async -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        return await withCheckedContinuation { continuation in
+            process.terminationHandler = { continuation.resume(returning: $0.terminationStatus == 0) }
+            do { try process.run() }
+            catch {
+                NSLog("SmartConnect: updates: could not start \(executable): \(error)")
+                continuation.resume(returning: false)
+            }
+        }
+    }
+
+    /// "v0.2.0" > "0.1.0", "0.10.0" > "0.9.0", "v1" > "0.1.0": numeric per dot-separated part,
+    /// missing parts count as 0, and a tag suffix ("-beta", as on a hand-cut release) drops. A
+    /// tag that compares equal (or below) is the version we already run.
+    static func isNewer(_ tag: String, than version: String) -> Bool {
+        func numbers(_ s: String) -> [Int] {
+            s.trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
+                .split(separator: ".")
+                .map { part in Int(part.prefix(while: { $0.isNumber })) ?? 0 }
+        }
+        let a = numbers(tag)
+        let b = numbers(version)
+        for i in 0..<max(a.count, b.count) {
+            let left = i < a.count ? a[i] : 0
+            let right = i < b.count ? b[i] : 0
+            if left != right { return left > right }
+        }
+        return false
+    }
+}
+
 struct SettingsView: View {
+    @ObservedObject private var updates = UpdateChecker.shared
     private var _daemon: EnvironmentObject<DaemonClient> = EnvironmentObject()
     private var daemon: DaemonClient { _daemon.wrappedValue }
     private var _launchAtLogin: State<Bool> = State(initialValue: SMAppService.mainApp.status == .enabled)
@@ -3394,6 +3936,69 @@ struct SettingsView: View {
                         }
                     }
                 if let error { Text(error).font(.caption).foregroundStyle(.red) }
+            }
+            Section("Updates") {
+                LabeledContent("This copy") { Text(UpdateChecker.version) }
+                Text(updates.status)
+                    .font(.caption)
+                    .foregroundStyle(updates.available ? Color.accentColor : Color.secondary)
+                HStack(spacing: 8) {
+                    Button {
+                        Task { await updates.check() }
+                    } label: {
+                        Label(updates.phase == .checking ? "Checking…" : "Check for Updates",
+                              systemImage: updates.phase == .checking ? "hourglass" : "arrow.clockwise")
+                    }
+                    .controlSize(.small)
+                    .disabled(updates.phase == .checking)
+                    Spacer(minLength: 8)
+                    Button {
+                        if let url = URL(string: updates.release?.url ?? UpdateChecker.releasePage) {
+                            NSWorkspace.shared.open(url)
+                        }
+                    } label: {
+                        Label(updates.available ? "View release" : "Releases on GitHub",
+                              systemImage: "safari")
+                    }
+                    .controlSize(.small)
+                }
+                if updates.available && updates.install == .idle {
+                    HStack(spacing: 8) {
+                        Button {
+                            updates.downloadAndInstall()
+                        } label: {
+                            Label("Download and Install", systemImage: "arrow.down.circle")
+                        }
+                        .controlSize(.small)
+                        if let asset = updates.release?.asset {
+                            Text("(\(asset.name), \(ByteCountFormatter.string(fromByteCount: asset.size, countStyle: .file)))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                if let step = updates.installStatus {
+                    HStack(spacing: 8) {
+                        if updates.install == .downloading || updates.install == .installing {
+                            ProgressView().controlSize(.small)
+                        }
+                        Text(step)
+                            .font(.caption)
+                            .foregroundStyle(updates.installFailed ? Color.red : Color.secondary)
+                        Spacer(minLength: 8)
+                        if updates.install == .downloading {
+                            Button("Cancel") { updates.cancelInstall() }
+                                .controlSize(.small)
+                        }
+                        if updates.installFailed {
+                            Button("Try again") { updates.retryInstall() }
+                                .controlSize(.small)
+                        }
+                    }
+                }
+                Text("Checks the project's GitHub releases once at launch (a new version announces itself with a notification, once per release) and whenever you press the button. *Download and Install* fetches the release's disk image, replaces this copy with it and starts the new one — the app restarts, your settings and pairing state stay in the state folder. A release ships without an image (or you prefer your own way), *View release* opens the page in your browser.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("Appearance") {
                 Toggle("Show SmartConnect in the Dock", isOn: _showInDock.projectedValue)

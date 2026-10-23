@@ -232,6 +232,20 @@ does; the protocol side only delivers call *state*.
 The Settings page has:
 
 - **Start SmartConnect at login**.
+- **Updates** — *This copy* (the running version), the state of the project's GitHub releases, a
+  **Check for Updates** button and a link to the release page. One silent check runs a few seconds
+  after launch; a tag newer than the copy you run shows as *"vX.Y.Z — name is available · your copy
+  is A.B.C (published …)"* and announces itself once per release with a notification whose click
+  opens the release page. Failures say what happened (offline, rate-limited, no release published).
+  **Download and Install** updates in place from the same page: the release's disk image is fetched
+  with progress (and a **Cancel**), then `update.sh` in the state folder waits for the running copy
+  to exit, mounts the image, stages the new bundle beside the old one, swaps it in, drops the
+  download's quarantine and starts the new version — an administrator prompt appears only where the
+  folder you installed into isn't yours to write, and everything is logged to `update.log` (a
+  failure after the window is gone comes back as a notification, not silently). Settings and
+  pairing state live in the state folder, so they survive the switch. **View release** is the
+  manual way: the release page opens in your browser (dmg, `brew`, a fresh
+  [build](#build-from-source)).
 - **Show SmartConnect in the Dock** — off by default (menu bar only); on gives the app a Dock tile.
 - **Stream apps in** — *Landscape (tablet size)* (default) or *Portrait (phone shape)*. See
   [Streams](#streams).
