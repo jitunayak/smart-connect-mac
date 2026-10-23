@@ -1268,10 +1268,10 @@ struct MainWindow: View {
                 default: SettingsView()
                 }
             }
-            .padding(.top, 34) // clearance under the traffic lights
-            .padding(.horizontal, 22)
-            .padding(.vertical, 14)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            // Only the rail keeps the glass vibrancy; the content pane is the normal,
+            // opaque window background like before, with the pages' own paddings.
+            .background(Color(nsColor: .windowBackgroundColor))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.ultraThinMaterial)
