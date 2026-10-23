@@ -1,0 +1,43 @@
+//! A macOS peer for Motorola Smart Connect that the unmodified phone app treats as a
+//! Windows/macOS PC. Protocol notes live in `docs/protocol/`.
+
+pub mod app_icons;
+#[cfg(target_os = "linux")]
+#[path = "ble.rs"]
+pub mod ble;
+#[cfg(target_os = "macos")]
+#[path = "ble_macos.rs"]
+pub mod ble;
+#[cfg(target_os = "linux")]
+#[path = "ble_connect.rs"]
+pub mod ble_connect;
+#[cfg(target_os = "macos")]
+#[path = "ble_connect_macos.rs"]
+pub mod ble_connect;
+pub mod clipboard;
+pub mod control;
+pub mod discovery;
+#[cfg(target_os = "linux")]
+#[path = "helpers_linux.rs"]
+pub mod helpers;
+#[cfg(target_os = "macos")]
+#[path = "helpers_macos.rs"]
+pub mod helpers;
+pub mod hotspot;
+pub mod identity;
+pub mod invite;
+#[cfg(target_os = "linux")]
+#[path = "notifications.rs"]
+pub mod notifications;
+#[cfg(target_os = "macos")]
+#[path = "notifications_macos.rs"]
+pub mod notifications;
+pub mod pairing;
+pub mod pc_lock;
+pub mod platform;
+pub mod proto;
+pub mod reconnect;
+pub mod server;
+pub mod sms;
+pub mod status;
+pub mod webcam;

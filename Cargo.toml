@@ -1,0 +1,52 @@
+[package]
+name = "smartconnect-mac"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "smartconnectd for macOS: unofficial peer for the Motorola Smart Connect phone app (pairing, sessions, notifications, clipboard, SMS, control socket)"
+
+[workspace]
+members = ["fex"]
+resolver = "3"
+
+[dependencies]
+anyhow = "1.0.104"
+aes-gcm = "0.10.3"
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+gethostname = "1.1.0"
+hex = "0.4.3"
+if-addrs = "0.15.0"
+libc = "0.2"
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+rand = "0.8"
+smartconnect-fex = { path = "fex" }
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+rsa = { version = "0.9.10", features = ["pem"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs", "process"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "0.17.4", features = ["bluetoothd"] }
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mdns-sd = "0.21"
+
+[lib]
+name = "smartconnect"
+path = "src/lib.rs"
+
+[[bin]]
+name = "smartconnectd"
+path = "src/main.rs"
+
+[profile.dev.package.rsa]
+opt-level = 3

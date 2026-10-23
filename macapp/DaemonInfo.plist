@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>app.smartconnect.mac.daemon</string>
+    <key>CFBundleName</key>
+    <string>smartconnectd</string>
+    <key>CFBundleExecutable</key>
+    <string>smartconnectd</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSBackgroundOnly</key>
+    <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Smart Connect finds and connects to your phone on the local network.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_readyformdns._tcp</string>
+    </array>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>Smart Connect uses Bluetooth to wake your paired phone.</string>
+</dict>
+</plist>
