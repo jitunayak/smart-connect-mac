@@ -133,7 +133,98 @@ struct PhoneNotification: Codable, Identifiable, Hashable {
     var title: String
     var body: String
     var replyable: Bool
+    /// True when the phone sent a call-style (type 6) frame: no Open, call action pills instead.
+    /// Optional because the daemon's status snapshot has no such field.
+    var isCall: Bool?
+    /// The phone's own action buttons (bridged with the frame): accept/decline/silence match by
+    /// name. Optional for the same reason.
+    var actions: [NotificationAction]?
     var id: String { key }
+}
+
+/// Call-notification helpers: the dialer's action labels are matched to the user-facing roles
+/// (Accept / Decline / Silence / End). Unknown labels are shown verbatim.
+enum CallUX {
+    static func role(_ action: NotificationAction) -> String {
+        let n = action.name.lowercased()
+        if ["answer", "accept", "respond"].contains(where: n.contains) { return "accept" }
+        if ["decline", "reject", "refuse"].contains(where: n.contains) { return "decline" }
+        if n.contains("silence") { return "silence" }
+        if ["hang up", "hangup", "end call", "end"].contains(where: n.contains) { return "hang" }
+        return action.name
+    }
+
+    static func first(_ note: PhoneNotification, _ role: String) -> NotificationAction? {
+        (note.actions ?? []).filter { !$0.reply && Self.role($0) == role }.first
+    }
+
+    /// A ringing call carries an Answer action; Android turns the same key into an ongoing-call
+    /// notification (Answer gone, Hang-up present) once the call is picked up.
+    static func isRinging(_ note: PhoneNotification) -> Bool {
+        first(note, "accept") != nil
+    }
+
+    /// The pill label for one action: our wording for known roles, the dialer's otherwise.
+    static func display(_ action: NotificationAction) -> String {
+        switch role(action) {
+        case "accept": return "Accept"
+        case "decline": return "Decline"
+        case "silence": return "Silence"
+        case "hang": return "End"
+        default: return action.name
+        }
+    }
+}
+
+/// Call pill row (Notifications page rows and the menu panel's compact rows): the banner click
+/// does nothing here — only the actions run. The dialer's own labels are relabelled where the
+/// role is unambiguous, and the phone stays the single source of state: an Answer action means
+/// still ringing, its disappearance (Android re-shapes the notification) means ongoing.
+private struct CallActionRow: View {
+    private var _daemon: EnvironmentObject<DaemonClient> = EnvironmentObject()
+    private var daemon: DaemonClient { _daemon.wrappedValue }
+    let note: PhoneNotification
+
+    var body: some View {
+        if CallUX.isRinging(note) {
+            HStack(spacing: 6) {
+                ForEach((note.actions ?? []).filter { !$0.reply }, id: \.id) { action in
+                    pill(action)
+                }
+            }
+        } else {
+            HStack(spacing: 10) {
+                Label("Ongoing call", systemImage: "phone.connection.fill")
+                    .font(.caption2.bold())
+                    .foregroundStyle(.green)
+                if let end = CallUX.first(note, "hang") {
+                    pill(end)
+                }
+            }
+        }
+    }
+
+    private func pill(_ action: NotificationAction) -> some View {
+        let role = CallUX.role(action)
+        return Button {
+            // No handled-mark here: the phone's own notification lifecycle (Answer gone / the
+            // notification removed) settles the row's section and the indicator.
+            daemon.runAction(key: note.key, service: note.service, actionID: action.id, mark: false)
+        } label: {
+            Text(CallUX.display(action))
+                .font(.caption)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(
+                    role == "accept" ? Color.green
+                        : role == "decline" || role == "hang" ? Color.red
+                        : Color.gray
+                ))
+                .foregroundStyle(role == "silence" ? Color.primary : Color.white)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
 }
 
 /// Phone apps that also exist as Mac apps: clicking such a notification opens the local app
@@ -231,6 +322,9 @@ final class DaemonClient: ObservableObject {
     @Published var handledKeys: Set<String> = []
     /// Keys hidden on purpose via the per-row clear button, whatever list they came from.
     private var hiddenKeys: Set<String> = []
+    /// The phone's ongoing call: a call notification that no longer carries an Answer action
+    /// (Android re-shapes the same key after pick-up). Drives the ongoing-call indicators.
+    @Published var ongoingCall: PhoneNotification?
     /// Bridge retention: enough for several days of typical notifications.
     private static let bridgeCapacity = 200
 
@@ -263,18 +357,39 @@ final class DaemonClient: ObservableObject {
         if bridgeNotifications.count > Self.bridgeCapacity {
             bridgeNotifications.removeLast(bridgeNotifications.count - Self.bridgeCapacity)
         }
+        updateOngoingCall(note)
+    }
+
+    /// Tracks the call state off Android's own notification reshapes: while the key carries an
+    /// Answer action it is ringing, and once Answer disappears (Hang-up only) it counts as
+    /// ongoing — however the call was picked up (on the phone or from the Mac).
+    private func updateOngoingCall(_ note: PhoneNotification) {
+        guard note.isCall == true else { return }
+        if CallUX.isRinging(note) {
+            if ongoingCall?.key == note.key {
+                ongoingCall = nil // ended, and the same key started ringing again
+            }
+        } else {
+            ongoingCall = note
+        }
     }
 
     /// The notification no longer exists on the phone (dismissed there): keep it listed,
     /// but move it into the "Earlier" (already handled) section.
     func markHandled(key: String) {
         handledKeys.insert(key)
+        if key == ongoingCall?.key {
+            ongoingCall = nil // call over: its notification was removed on the phone
+        }
     }
 
     /// Per-row clear: forget the entry everywhere it is listed from.
     func removeNote(key: String) {
         bridgeNotifications.removeAll { $0.key == key }
         hiddenKeys.insert(key)
+        if key == ongoingCall?.key {
+            ongoingCall = nil
+        }
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [key])
     }
 
@@ -390,8 +505,10 @@ final class DaemonClient: ObservableObject {
         send(service: service, data: ["cmd": 0, "event": 2, "key": key, "version": "1.0"])
     }
 
-    func runAction(key: String, service: Int, actionID: Int) {
-        markHandled(key: key)
+    func runAction(key: String, service: Int, actionID: Int, mark: Bool = true) {
+        if mark {
+            markHandled(key: key)
+        }
         send(service: service, data: ["cmd": 0, "event": 1, "key": key, "version": "1.0", "data": ["action_id": actionID]])
     }
 
@@ -426,6 +543,7 @@ struct NotificationFrame: Codable {
     var icon: String?
     var picture: String?
     var actions: [NotificationAction]?
+    var isCall: Bool?
 }
 
 final class NotificationBridge: NSObject {
@@ -489,7 +607,9 @@ final class NotificationBridge: NSObject {
             pkg: frame.pkg ?? "",
             title: title,
             body: body,
-            replyable: frame.replyable == true
+            replyable: frame.replyable == true,
+            isCall: frame.isCall,
+            actions: frame.actions
         ))
         let content = UNMutableNotificationContent()
         content.title = title
@@ -497,7 +617,8 @@ final class NotificationBridge: NSObject {
         content.body = body
         content.sound = .default
         content.threadIdentifier = key
-        content.userInfo = ["key": key, "service": frame.service ?? 5, "app": app, "pkg": frame.pkg ?? ""]
+        content.userInfo = ["key": key, "service": frame.service ?? 5, "app": app,
+                            "pkg": frame.pkg ?? "", "isCall": frame.isCall == true]
         content.categoryIdentifier = registerCategory(for: frame)
 
         let attachmentPath = frame.picture ?? frame.icon
@@ -520,7 +641,13 @@ final class NotificationBridge: NSObject {
     /// list, not by key.
     private func registerCategory(for frame: NotificationFrame) -> String {
         var actions: [UNNotificationAction] = []
-        if frame.replyable == true {
+        if frame.isCall == true {
+            // Calls never get an "open": Accept/Decline/Silence only, relabelled to our wording.
+            for a in frame.actions ?? [] where !a.reply {
+                let title = a.reply ? a.name : CallUX.display(a)
+                actions.append(UNNotificationAction(identifier: "a\(a.id)", title: title, options: []))
+            }
+        } else if frame.replyable == true {
             actions.append(UNTextInputNotificationAction(
                 identifier: "reply",
                 title: "Reply",
@@ -536,9 +663,9 @@ final class NotificationBridge: NSObject {
                     : "Open on phone",
                 options: []
             ))
-        }
-        for a in frame.actions ?? [] where !a.reply {
-            actions.append(UNNotificationAction(identifier: "a\(a.id)", title: a.name, options: []))
+            for a in frame.actions ?? [] where !a.reply {
+                actions.append(UNNotificationAction(identifier: "a\(a.id)", title: a.name, options: []))
+            }
         }
         let signature = actions.map(\.identifier).joined(separator: ",")
         let identifier = "sc-" + signature.unicodeScalars.map { String(format: "%02x", $0.value) }.joined().prefix(60)
@@ -566,12 +693,19 @@ extension NotificationBridge: UNUserNotificationCenterDelegate {
         let service = info["service"] as? Int ?? 5
         let app = info["app"] as? String
         let pkg = info["pkg"] as? String
+        let isCall = info["isCall"] as? Bool == true
         let action = response.actionIdentifier
         DispatchQueue.main.async {
             if action == "reply", let text = (response as? UNTextInputNotificationResponse)?.userText, !text.isEmpty {
                 DaemonClient.shared.reply(key: key, text: text)
                 DaemonClient.shared.markHandled(key: key)
-            } else if action == UNNotificationDefaultActionIdentifier || action == "open" {
+            } else if action == UNNotificationDefaultActionIdentifier {
+                // Call banners are click-through-free: actions only, never the streamed app.
+                if !isCall {
+                    DaemonClient.shared.openOnPhone(key: key, service: service, app: app, pkg: pkg)
+                    DaemonClient.shared.markHandled(key: key)
+                }
+            } else if action == "open" {
                 DaemonClient.shared.openOnPhone(key: key, service: service, app: app, pkg: pkg)
                 DaemonClient.shared.markHandled(key: key)
             } else if action.hasPrefix("a"), let id = Int(action.dropFirst()) {
@@ -813,6 +947,30 @@ struct MenuContent: View {
                     .padding(.vertical, 4)
                     .background(Capsule().fill(Color.primary.opacity(0.06)))
                 }
+            }
+
+            // Ongoing-call indicator: shows while the phone has a call in progress, however it
+            // was picked up (on the phone or from the Mac); End hangs up through the call action.
+            if let call = daemon.ongoingCall {
+                HStack(spacing: 8) {
+                    Image(systemName: "phone.connection.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.green)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(call.title).font(.caption).fontWeight(.medium).lineLimit(1)
+                        Text("Ongoing call").font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if let end = CallUX.first(call, "hang") {
+                        Button("End") {
+                            daemon.runAction(key: call.key, service: call.service, actionID: end.id, mark: false)
+                        }
+                        .controlSize(.small)
+                        .buttonStyle(.bordered)
+                    }
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color.green.opacity(0.12)))
             }
 
             Picker("Panel", selection: _section.projectedValue) {
@@ -1306,15 +1464,21 @@ struct MenuNotificationsSection: View {
                     }
                     .buttonStyle(.plain)
                 } else {
-                    if note.replyable {
-                        Button("Reply") {
-                            replying = note
-                            replyText = ""
+                    if note.isCall == true {
+                        // Calls: Accept / Decline / Silence pills (End when ongoing) — the app
+                        // itself is never opened or streamed for a call notification.
+                        CallActionRow(note: note)
+                    } else {
+                        if note.replyable {
+                            Button("Reply") {
+                                replying = note
+                                replyText = ""
+                            }
+                            .buttonStyle(.link).font(.caption)
                         }
-                        .buttonStyle(.link).font(.caption)
+                        Button("Open") { daemon.openOnPhone(key: note.key, service: note.service, app: note.app, pkg: note.pkg) }
+                            .buttonStyle(.link).font(.caption)
                     }
-                    Button("Open") { daemon.openOnPhone(key: note.key, service: note.service, app: note.app, pkg: note.pkg) }
-                        .buttonStyle(.link).font(.caption)
                 }
             }
             Text(note.title).font(.callout).lineLimit(1)
@@ -1528,6 +1692,28 @@ struct PhoneView: View {
                     InfoTile(title: "Bluetooth", value: s.bluetooth ? "On" : "Off", icon: "dot.radiowaves.left.and.right")
                     InfoTile(title: "Unread", value: s.unread.map(String.init) ?? "—", icon: "bell")
                 }
+            }
+
+            // Ongoing call: green tile with an End button; same state the menu panel shows.
+            if let call = daemon.ongoingCall {
+                HStack(spacing: 12) {
+                    Image(systemName: "phone.connection.fill")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(.green)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(call.title).font(.headline).lineLimit(1)
+                        Text("Ongoing call").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if let end = CallUX.first(call, "hang") {
+                        Button("End") {
+                            daemon.runAction(key: call.key, service: call.service, actionID: end.id, mark: false)
+                        }
+                        .controlSize(.small)
+                    }
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color.green.opacity(0.12)))
             }
 
             HStack {
@@ -1861,17 +2047,21 @@ struct NotificationsView: View {
                     }
                     .buttonStyle(.link)
                 } else {
-                    if note.replyable {
-                        Button("Reply") {
-                            replying = note
-                            replyText = ""
+                    if note.isCall == true {
+                        CallActionRow(note: note)
+                    } else {
+                        if note.replyable {
+                            Button("Reply") {
+                                replying = note
+                                replyText = ""
+                            }
+                            .buttonStyle(.link)
+                        }
+                        Button("Open") {
+                            daemon.openOnPhone(key: note.key, service: note.service, app: note.app, pkg: note.pkg)
                         }
                         .buttonStyle(.link)
                     }
-                    Button("Open") {
-                        daemon.openOnPhone(key: note.key, service: note.service, app: note.app, pkg: note.pkg)
-                    }
-                    .buttonStyle(.link)
                 }
             }
             Text(note.title).font(isHandled ? .callout : .headline)
@@ -2554,9 +2744,15 @@ final class StreamSession {
     private(set) var pendingLocal: [(mLine: Int, candidate: String)] = []
     /// Offer awaiting the page's ready signal.
     var pendingOffer: String?
+    /// Set once a headless close is scheduled, so the cmd 13 and safety timers don't double-book.
+    var headlessClosed = false
     private(set) var window: StreamWindow?
+    /// True for notification "background actions": answered with no window, released right
+    /// after the phone fires the intent (svc 15 cmd 13 for the virtual display).
+    let headless: Bool
 
-    init(sid: Int64, pkg: String, userId: Any, cmp: Any?, shortcutId: Any?, name: String?, isView: Bool) {
+    init(sid: Int64, pkg: String, userId: Any, cmp: Any?, shortcutId: Any?, name: String?,
+         isView: Bool, headless: Bool = false) {
         self.sid = sid
         self.pkg = pkg
         self.userId = userId
@@ -2564,9 +2760,13 @@ final class StreamSession {
         self.shortcutId = shortcutId
         self.name = name
         self.isView = isView
+        self.headless = headless
     }
 
     var windowTitle: String {
+        if headless {
+            return "\(name ?? pkg) — headless"
+        }
         if isView {
             return ["mirror": "Phone — Smart Connect", "desktop": "Mobile desktop — Smart Connect",
                     "mobile": "Virtual phone — Smart Connect"][pkg] ?? "\(pkg) — Phone"
@@ -2578,8 +2778,13 @@ final class StreamSession {
     /// keyboard + mouse (svc 16 REQUEST_CAP, caps bit0 keyboard | bit1 mouse).
     func learnDisplay(_ body: [String: Any]) {
         guard let d = StreamValue.int(body["displayId"]), d >= 0 else { return }
-        let first = !capRequested.contains(d)
         displayId = Int64(d)
+        // Headless sessions never receive input, so they skip the capability request entirely
+        // (the Linux host does the same).
+        if headless {
+            return
+        }
+        let first = !capRequested.contains(d)
         capRequested.insert(d)
         if first {
             NSLog("SmartConnect: stream \(sid) (\(pkg)): input: requesting keyboard+mouse on display \(d)")
@@ -2670,11 +2875,14 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
     /// every 5 minutes so opening the panel is instant from the cache, not a refresh ritual.
     private(set) var lastAppsRequest: Date?
     private var sessions: [Int64: StreamSession] = [:]
+    /// Notification actions the phone is about to run through app streaming (svc 15 `cmd 2`
+    /// invites): pkg → deadline. The invite is answered headlessly so no window opens.
+    private var pendingActions: [String: Date] = [:]
     private var lastHb: Date?
     /// The phone's desktop resolution, sent in its Screen-share/Mobile-desktop cmd 0 (view 2).
     private var viewResolution: (Int, Int)?
     /// The phone keeps a single pending start per PC: one cmd 1 at a time, 20 s timeout.
-    private var inflight: (pkg: String, cmp: Any?, userId: Any, shortcutId: Any?, at: Date)?
+    private var inflight: (pkg: String, cmp: Any?, userId: Any, shortcutId: Any?, at: Date, headless: Bool)?
     private var instanceId: Int64 = 0
     private var senderRef: StreamSender?
 
@@ -2744,7 +2952,7 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
         DispatchQueue.global(qos: .utility).async {
             while true {
                 if let fd = UnixSocket.connect(path: Paths.controlSocket, timeout: 0) {
-                    UnixSocket.writeLine("{\"cmd\":\"watch\",\"services\":[1,15,16,17]}", to: fd)
+                    UnixSocket.writeLine("{\"cmd\":\"watch\",\"services\":[1,15,16,17,-1]}", to: fd)
                     while let line = UnixSocket.readLine(from: fd) {
                         guard let d = line.data(using: .utf8),
                               let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
@@ -2854,7 +3062,27 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
         case 1: onService1(body)
         case 15: onService15(body)
         case 17: onService17(body)
+        case -1: onLocalEvent(body)
         default: break // 16: capability replies and pointer images are informational
+        }
+    }
+
+    /// Daemon-local events (svc -1): the notification action the App (or its UI) just pressed.
+    /// `{"event":"notification_action","kind":"action"|"open","pkg","key","actionId","service"}`
+    /// arrives before the click goes to the phone, so the app-stream invite the phone answers
+    /// with (svc 15 `cmd 2` for that pkg) can be recognized: actions are answered headlessly
+    /// (no window), "open" keeps the visible stream.
+    private func onLocalEvent(_ body: [String: Any]) {
+        guard body["event"] as? String == "notification_action" else { return }
+        let pkg = body["pkg"] as? String ?? ""
+        let kind = body["kind"] as? String ?? ""
+        guard !pkg.isEmpty, kind == "action" || kind == "open" else { return }
+        if kind == "open" {
+            pendingActions.removeValue(forKey: pkg)
+            NSLog("SmartConnect: notifications: open click for \(pkg): the invite will open a window")
+        } else {
+            pendingActions[pkg] = Date().addingTimeInterval(6)
+            NSLog("SmartConnect: notifications: action click for \(pkg): answering the invite headlessly")
         }
     }
 
@@ -2996,7 +3224,8 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
     }
 
     var streamList: [(sid: Int64, title: String)] {
-        sessions.values.sorted { $0.sid < $1.sid }.map { ($0.sid, $0.windowTitle) }
+        sessions.values.filter { !$0.headless }
+            .sorted { $0.sid < $1.sid }.map { ($0.sid, $0.windowTitle) }
     }
 
     /// The daemon's icon cache; icon names are `<pkg>_<cmp>.png` (fex default on macOS:
@@ -3058,6 +3287,13 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
             if let d = StreamValue.int(body["displayId"]), let s = byDisplay(Int64(d)) { s.raise() }
         case 13:
             if let d = StreamValue.int(body["displayId"]), let s = byDisplay(Int64(d)) {
+                if s.headless {
+                    // AppTopData: the app gained focus on its virtual display, so the phone has
+                    // fired the intent. Give the PendingIntent a beat, then release the stream
+                    // (matches the Linux host: 2.5 s, 12 s cap after cmd 4, max 30 s).
+                    scheduleHeadlessClose(s, after: 2.5)
+                    return
+                }
                 let appName = body["appName"] as? String ?? ""
                 if !appName.isEmpty && !StreamHost.isViewPkg(s.pkg) {
                     s.name = appName
@@ -3090,6 +3326,9 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
         if let current = inflight, !current.pkg.isEmpty, Date().timeIntervalSince(current.at) >= 20 {
             NSLog("SmartConnect: stream: start of \(current.pkg) timed out")
         }
+        // A pending notification action means this invite belongs to a click the app (or its UI)
+        // just made: answer it without a window, run the phone's intent headlessly.
+        let headless = (pendingActions[pkg].map { $0 > Date() } ?? false) && !StreamHost.isViewPkg(pkg)
         // The bound the phone fits the stream into; "desktop" uses the phone's own desktop
         // resolution when the cmd 0 carried one, 1920x1080 otherwise (the phone's default).
         let (w, h) = pkg == "desktop" ? (viewResolution ?? (1920, 1080)) : (1920, 1080)
@@ -3108,7 +3347,10 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
         if let cmp { data["cmp"] = cmp }
         if let shortcutId { data["shortcutId"] = shortcutId }
         send15(1, data)
-        inflight = (pkg, cmp, userId, shortcutId, Date())
+        if headless {
+            pendingActions.removeValue(forKey: pkg) // consumed by this invite
+        }
+        inflight = (pkg, cmp, userId, shortcutId, Date(), headless)
         _ = name // app titles come from svc 15 cmd 13 once the display is up
     }
 
@@ -3143,7 +3385,8 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
                               cmp: body["cmp"] ?? inflight?.cmp,
                               shortcutId: body["shortcutId"] ?? inflight?.shortcutId,
                               name: body["pkgName"] as? String,
-                              isView: StreamHost.isViewPkg(pkg))
+                              isView: StreamHost.isViewPkg(pkg),
+                              headless: inflight?.headless == true)
         sessions[sid] = s
         notify()
         finishInflight(pkg, ok: true, why: "offer")
@@ -3178,6 +3421,14 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
     private func openSession(_ s: StreamSession, offer: String, filter: StreamIceFilter) {
         guard s.window == nil else { return }
         iceFilter = filter
+        if s.headless {
+            // Notification background action: an off-screen page answers the offer; nothing
+            // shows and the session is released once the phone reports the app up (cmd 13).
+            let view = StreamWindow(session: s, headless: true)
+            s.attach(window: view, offer: offer)
+            NSLog("SmartConnect: stream \(s.sid) (\(s.pkg)): headless session, ICE filter \(filter.label)")
+            return
+        }
         let (frameW, frameH) = s.stream ?? (1920, 1080)
         let aspect = Double(frameH) / Double(max(1, frameW))
         let screen = NSScreen.screens.count > 1 ? NSScreen.screens[1] : (NSScreen.main ?? NSScreen.screens.first)
@@ -3388,8 +3639,25 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
         // One heartbeat right away; the 30 s cadence keeps every later session alive.
         send15(9, nil)
         lastHb = Date()
+        if s.headless {
+            // Safety net: if cmd 13 never arrives (the intent did not run), don't keep the
+            // headless session forever (the Linux host caps at 12 s after cmd 4).
+            scheduleHeadlessClose(s, after: 12)
+        }
         for (mLine, candidate) in s.pendingLocalFlush() {
             sendCandidate(s, mLine: mLine, candidate: candidate)
+        }
+    }
+
+    /// Closes a headless session after a delay unless it already closed (or the user's clickable
+    /// stream for the same app run arrived meanwhile — headless sessions are keyed by their own
+    /// sid, so a normal window for the app is unaffected).
+    private func scheduleHeadlessClose(_ s: StreamSession, after seconds: Double) {
+        guard !s.closing, !s.headlessClosed else { return }
+        s.headlessClosed = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { @MainActor [weak self] in
+            guard let self, self.sessions[s.sid] === s else { return }
+            self.closeSession(s.sid, why: "headless action stream done", tellPhone: true)
         }
     }
 
@@ -3504,16 +3772,14 @@ final class StreamWindow: NSObject, NSWindowDelegate, WKScriptMessageHandler {
         NSLog("SmartConnect: stream \(session.sid) (\(session.pkg)): window refit to video \(w)x\(h)")
     }
 
-    init(session: StreamSession, frame: NSRect) {
+    /// A real stream window (frame is the on-screen content frame), or — with `headless` —
+    /// a detached WKWebView with no window at all: WebRTC still runs and answers the offer,
+    /// which is all the phone needs to fire the notification intent on its virtual display.
+    init(session: StreamSession, frame: NSRect = NSRect(x: 0, y: 0, width: 640, height: 360),
+         headless: Bool = false) {
         self.session = session
         self.title = session.windowTitle
         super.init()
-        let window = NSWindow(contentRect: frame,
-                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
-                              backing: .buffered, defer: false)
-        window.title = title
-        window.isReleasedWhenClosed = false
-        window.delegate = self
         let config = WKWebViewConfiguration()
         config.userContentController.add(self, name: "bridge")
         // The stream is video-only; autoplay must work without a user gesture to answer at all.
@@ -3525,9 +3791,17 @@ final class StreamWindow: NSObject, NSWindowDelegate, WKScriptMessageHandler {
                              configuration: config)
         view.allowsMagnification = false
         view.autoresizingMask = [.width, .height]
-        window.contentView = view
-        self.window = window
         self.webView = view
+        if !headless {
+            let window = NSWindow(contentRect: frame,
+                                  styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                                  backing: .buffered, defer: false)
+            window.title = title
+            window.isReleasedWhenClosed = false
+            window.delegate = self
+            window.contentView = view
+            self.window = window
+        }
         // WebRTC needs a secure context: load the page over loopback HTTP (WebKit treats
         // 127.0.0.1 as trustworthy); `loadHTMLString` pages cannot do RTCPeerConnection.
         if let url = StreamPage.server?.url {

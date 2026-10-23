@@ -237,6 +237,18 @@ which apps it forwards.
   running) answers that request **without opening a window** and closes the stream again a few
   seconds later, after the phone reports that the app is up. Set
   `SMARTCONNECT_BACKGROUND_ACTIONS=0` in the daemon's environment to get a window instead.
+- **Calls** (macOS app): a call notification (call style, e.g. the dialer) shows **Accept / Decline /
+  Silence pills** in the app's Notifications sections and gets the same actions on its macOS
+  banner — never an Open, and banner taps do nothing, so the dialer app is never streamed for a
+  call. Actions are matched by label (Answer/Decline/Silence and localized-style variants); a
+  label the app doesn't know is shown as the phone sends it. When a call is picked up — from the
+  phone or from the Mac, however — Android reshapes the same notification (Answer gone, Hang-up
+  only) and the app **switches the row to an ongoing-call indicator** and shows one in the menu
+  panel header and on the Phone page (green tile with **End**); it clears when the call ends.
+  Clicking an action on any notification runs through the phone's app-stream invite answered
+  **headlessly** (the same background-action behaviour the Linux host has: no window opens, the
+  stream is released a beat after the intent fires). (🟡 built; on-device ringing/pill flow not
+  yet verified.)
 - **Open on phone** (🟡): clicking a notification that can't be replied to — or *Open on phone* in the
   GTK app's **⋯** menu — opens that app in its own window on the PC through
   [app streaming](#app-streaming), as on Windows.

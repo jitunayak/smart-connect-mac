@@ -10,6 +10,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The READM
 
 ### Added
 
+- macOS app: **call notifications** show Accept / Decline / Silence pills in the notifications list
+  and the same labelled buttons on the macOS banner; there is no Open for a call and banner taps do
+  nothing, so the dialer is never streamed for a call. Once the call is picked up (Android reshapes
+  the same notification: Answer gone, Hang-up only) the row switches to an ongoing-call indicator,
+  and the menu panel header and the Phone page show a green ongoing tile with an **End** button;
+  it clears when the call ends. Supporting this, notification action clicks are answered
+  headlessly: the daemon announces each click on the watch stream (svc -1) before forwarding it, and
+  the app answers the phone's app-stream invite with no window and releases the stream after the
+  intent fires (Linux host parity, `.notes/notification-background-actions.md`). (🟡 built; the
+  ringing/pill/headless flow is not yet verified on a device.)
 - macOS app: the phone's apps show as a **grid of icons** instead of a row list — on the window's
   Streams page (40 pt launcher icons, two-line names, package in the hover tooltip) and in the
   menu-bar panel's Streams card (30 pt icons, one-line names). Clicking an icon starts the app on

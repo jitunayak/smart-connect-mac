@@ -207,6 +207,9 @@ impl Notifier {
             let reply = a.get("remote_input").and_then(Value::as_bool) == Some(true);
             actions.push(json!({ "id": id, "name": name, "reply": reply }));
         }
+        // Call (type 6): the app maps the dialer's actions to Accept/Decline/Silence pills and
+        // never opens the streamed app for it.
+        let is_call = n.get("type").and_then(Value::as_i64) == Some(6);
 
         let frame = json!({
             "type": "notification",
@@ -220,6 +223,7 @@ impl Notifier {
             "icon": icon,
             "picture": picture,
             "actions": actions,
+            "isCall": is_call,
         });
         self.shown.lock().unwrap().seen.insert(key.to_owned());
         self.shown_text.lock().unwrap().insert(key.to_owned(), (title.clone(), body.clone(), app.clone()));
