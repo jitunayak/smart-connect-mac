@@ -319,6 +319,129 @@ private struct CallAvatar: View {
     }
 }
 
+/// The persistent call bar — the iPhone-calling equivalent of "the notification stays while the
+/// call runs", for the Mac: a floating always-on-top panel at the top of the screen with the
+/// caller's avatar, name, live duration and a red End circle. It appears when a call becomes
+/// ongoing (however it was picked up) and disappears when the phone clears the notification
+/// (call over). A UN banner cannot do this: macOS banners auto-dismiss within seconds.
+@MainActor
+final class CallPanelController: NSObject {
+    static let shared = CallPanelController()
+    private var panel: NSPanel?
+    private var shownKey: String?
+    private var lastShown: PhoneNotification?
+    private var timer: Timer?
+
+    func start() {
+        guard timer == nil else { return }
+        // Half a second of polling is nothing (the daemon work all lives elsewhere) and makes
+        // the panel immune to missed Combine events between objectWillChange and the value.
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            DispatchQueue.main.async { @MainActor in self?.refresh() }
+        }
+    }
+
+    func refresh() {
+        guard let call = DaemonClient.shared.ongoingCall else {
+            dismiss()
+            return
+        }
+        // Reinstall only on real changes (new key, or the same key's frame gained content), so
+        // the timer-driven tick does not churn the hosting view.
+        if shownKey == call.key && lastShown == call { return }
+        installAnyways(call: call)
+    }
+
+    private func installAnyways(call: PhoneNotification) {
+        shownKey = call.key
+        lastShown = call
+        if panel == nil {
+            let frame = NSRect(x: 0, y: 0, width: 340, height: 66)
+            let p = NSPanel(contentRect: frame,
+                            styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered, defer: false)
+            p.isOpaque = false
+            p.backgroundColor = .clear
+            p.hasShadow = true
+            p.level = .floating
+            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+            p.isMovableByWindowBackground = true
+            p.isReleasedWhenClosed = false
+            panel = p
+        }
+        let hosting = NSHostingView(rootView:
+            CallPanelContent()
+                .environmentObject(DaemonClient.shared)
+        )
+        panel?.contentView = hosting
+        placeAndShow()
+        NSLog("SmartConnect: call: persistent call bar shown for \(call.key)")
+    }
+
+    private func placeAndShow() {
+        guard let panel else { return }
+        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        panel.setFrame(NSRect(x: screen.midX - panel.frame.width / 2,
+                              y: screen.maxY - panel.frame.height - 6,
+                              width: panel.frame.width, height: panel.frame.height),
+                       display: true)
+        panel.orderFront(nil)
+    }
+
+    private func dismiss() {
+        guard panel != nil else { return }
+        panel?.orderOut(nil)
+        panel = nil
+        shownKey = nil
+        lastShown = nil
+        NSLog("SmartConnect: call: persistent call bar hidden (call over)")
+    }
+}
+
+private struct CallPanelContent: View {
+    private var _daemon: EnvironmentObject<DaemonClient> = EnvironmentObject()
+    private var daemon: DaemonClient { _daemon.wrappedValue }
+
+    var body: some View {
+        if let call = daemon.ongoingCall {
+            let start = daemon.ongoingCallSince ?? Date()
+            HStack(spacing: 12) {
+                CallAvatar(note: call, size: 42)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(call.title)
+                        .font(.system(.body, design: .default, weight: .semibold))
+                        .lineLimit(1)
+                    TimelineView(.periodic(from: start, by: 1)) { _ in
+                        let elapsed = max(0, Int(Date().timeIntervalSince(start)))
+                        Text("Ongoing call · \(elapsed / 60):\(String(format: "%02d", elapsed % 60))")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 8)
+                if let end = CallUX.first(call, "hang") {
+                    Button {
+                        daemon.runAction(key: call.key, service: call.service, actionID: end.id, mark: false)
+                    } label: {
+                        Image(systemName: "phone.down.fill")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: 38, height: 38)
+                            .background(Circle().fill(Color.red))
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(RoundedRectangle(cornerRadius: 22, style: .continuous).fill(.ultraThinMaterial))
+            .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08)))
+        }
+    }
+}
+
 /// Phone apps that also exist as Mac apps: clicking such a notification opens the local app
 /// instead of streaming the phone's copy (WhatsApp being the one that matters most).
 enum MacAppCounterpart {
@@ -420,6 +543,8 @@ final class DaemonClient: ObservableObject {
     /// The most recent ringing call notification (carries an Answer action): cleared when the
     /// same key turns ongoing, when it is handled, or removed on the phone.
     @Published var ringingCall: PhoneNotification?
+    /// When the ongoing call was detected (the pick-up reshape): drives the call bar's timer.
+    @Published var ongoingCallSince: Date?
     /// Bridge retention: enough for several days of typical notifications.
     private static let bridgeCapacity = 200
 
@@ -466,6 +591,9 @@ final class DaemonClient: ObservableObject {
                 ongoingCall = nil // ended, and the same key started ringing again
             }
         } else {
+            if ongoingCall?.key != note.key {
+                ongoingCallSince = Date() // fresh pick-up: timer restarts
+            }
             ongoingCall = note
             if ringingCall?.key == note.key {
                 ringingCall = nil // the pick-up came through
@@ -479,6 +607,7 @@ final class DaemonClient: ObservableObject {
         handledKeys.insert(key)
         if key == ongoingCall?.key {
             ongoingCall = nil // call over: its notification was removed on the phone
+            ongoingCallSince = nil
         }
         if key == ringingCall?.key {
             ringingCall = nil
@@ -491,6 +620,7 @@ final class DaemonClient: ObservableObject {
         hiddenKeys.insert(key)
         if key == ongoingCall?.key {
             ongoingCall = nil
+            ongoingCallSince = nil
         }
         if key == ringingCall?.key {
             ringingCall = nil
@@ -873,6 +1003,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DaemonClient.shared.start()
         NotificationBridge.shared.start()
         StreamHost.shared.start()
+        // The persistent call bar watches the outgoing-call state; empty when no call, so it
+        // can simply be started once at launch.
+        CallPanelController.shared.start()
         _ = ensureDaemonRunning()
 
         // A menu-bar-only app with no window is confusing on first launch. Show the main window
