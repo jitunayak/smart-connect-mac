@@ -10,6 +10,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The READM
 
 ### Added
 
+- macOS app: call notifications are presented **iPhone-calling style** — round caller photo
+  avatar (from the daemon's saved `person_icon`; launcher icon / person glyph as fallback), caller
+  name and an Incoming call / Ongoing call status line, the round red Decline + green Accept
+  phone circles (with a Silence link), and a single red End circle once the call is picked up —
+  in the Notifications rows, the menu panel header and the Phone page (ringing card switches to
+  ongoing automatically from Android's notification reshape).
 - macOS app: `svc 15 cmd 21 audioAppList` (the phone-audio feature: "apps playing audio") is logged
   as it arrives. Phone→PC audio cannot be implemented from this side yet: the requesting handshake
   and the audio channel were never captured (the mirror track is video-only), and Android blocks

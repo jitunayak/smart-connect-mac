@@ -139,6 +139,9 @@ struct PhoneNotification: Codable, Identifiable, Hashable {
     /// The phone's own action buttons (bridged with the frame): accept/decline/silence match by
     /// name. Optional for the same reason.
     var actions: [NotificationAction]?
+    /// Saved caller photo / app icon file from the daemon (CallData's `person_icon` is the caller).
+    var picture: String?
+    var icon: String?
     var id: String { key }
 }
 
@@ -176,54 +179,143 @@ enum CallUX {
     }
 }
 
-/// Call pill row (Notifications page rows and the menu panel's compact rows): the banner click
-/// does nothing here — only the actions run. The dialer's own labels are relabelled where the
-/// role is unambiguous, and the phone stays the single source of state: an Answer action means
-/// still ringing, its disappearance (Android re-shapes the notification) means ongoing.
-private struct CallActionRow: View {
+/// Call presentation in the iPhone-calling style (Notifications rows, and the panel/Phone page
+/// headers): caller avatar in a circle, name, status line, and round Answer/Decline (or End)
+/// buttons — the red and green phone circles. The banner click does nothing here: only actions
+/// run, and the streamed dialer app is never opened. When the dialer's action labels don't
+/// match the known roles, plain labelled buttons list what the phone offers.
+private struct CallCardView: View {
     private var _daemon: EnvironmentObject<DaemonClient> = EnvironmentObject()
     private var daemon: DaemonClient { _daemon.wrappedValue }
     let note: PhoneNotification
+    /// Compact: used inside notification rows. Full: the header cards.
+    var compact = true
 
     var body: some View {
-        if CallUX.isRinging(note) {
-            HStack(spacing: 6) {
-                ForEach((note.actions ?? []).filter { !$0.reply }, id: \.id) { action in
-                    pill(action)
+        let accept = CallUX.first(note, "accept")
+        let decline = CallUX.first(note, "decline")
+        let silence = CallUX.first(note, "silence")
+        let hang = CallUX.first(note, "hang")
+        let ringing = accept != nil
+        let avatarSize: CGFloat = compact ? 46 : 64
+        return HStack(spacing: compact ? 10 : 14) {
+            CallAvatar(note: note, size: avatarSize)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(note.title)
+                    .font(.system(size: compact ? 14 : 17, weight: .semibold))
+                    .lineLimit(1)
+                Text(ringing ? "Incoming call" : "Ongoing call")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if let silence, ringing, !compact, decline != nil {
+                    Button("Silence") { run(silence) }
+                        .buttonStyle(.link)
+                        .controlSize(.small)
+                        .padding(.top, 2)
                 }
             }
-        } else {
-            HStack(spacing: 10) {
-                Label("Ongoing call", systemImage: "phone.connection.fill")
-                    .font(.caption2.bold())
-                    .foregroundStyle(.green)
-                if let end = CallUX.first(note, "hang") {
-                    pill(end)
+            Spacer()
+            if ringing, let accept, let decline {
+                if compact {
+                    HStack(spacing: 10) {
+                        roundAction(decline, color: .red, icon: "phone.down.fill", label: nil, size: 38)
+                        roundAction(accept, color: .green, icon: "phone.fill", label: nil, size: 38)
+                    }
+                } else {
+                    HStack(alignment: .bottom, spacing: 40) {
+                        roundAction(decline, color: .red, icon: "phone.down.fill", label: "Decline", size: 54)
+                        roundAction(accept, color: .green, icon: "phone.fill", label: "Accept", size: 54)
+                    }
                 }
+            } else if !ringing, let hang {
+                // Ongoing: one red End circle at the right, iPhone-calling style.
+                if compact {
+                    roundAction(hang, color: .red, icon: "phone.down.fill", label: nil, size: 38)
+                } else {
+                    roundAction(hang, color: .red, icon: "phone.down.fill", label: "End", size: 54)
+                        .padding(.trailing, 20)
+                }
+            } else {
+                // Dialer labels we can't map: the phone's own wording as plain buttons.
+                HStack(spacing: 6) {
+                    ForEach((note.actions ?? []).filter { !$0.reply }, id: \.id) { action in
+                        Button(CallUX.display(action)) { run(action) }
+                            .buttonStyle(.link)
+                            .controlSize(.small)
+                    }
+                }
+            }
+        }
+        .padding(.vertical, compact ? 2 : 4)
+        .contentShape(Rectangle())
+    }
+
+    private func run(_ action: NotificationAction) {
+        // No handled-mark: the phone's own notification lifecycle (Answer gone / removed)
+        // settles the row's section, the ongoing marker and the indicators.
+        daemon.runAction(key: note.key, service: note.service, actionID: action.id, mark: false)
+    }
+
+    /// The iPhone-calling round button: colored circle, phone glyph, optional small label.
+    private func roundAction(_ action: NotificationAction, color: Color, icon: String,
+                             label: String?, size: CGFloat) -> some View {
+        VStack(spacing: 3) {
+            Button {
+                run(action)
+            } label: {
+                Image(systemName: icon)
+                    .font(.system(size: size * 0.42, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: size, height: size)
+                    .background(Circle().fill(color))
+                    .shadow(color: color.opacity(0.35), radius: 3, y: 1)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            if let label {
+                Text(label)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
         }
     }
+}
 
-    private func pill(_ action: NotificationAction) -> some View {
-        let role = CallUX.role(action)
-        return Button {
-            // No handled-mark here: the phone's own notification lifecycle (Answer gone / the
-            // notification removed) settles the row's section and the indicator.
-            daemon.runAction(key: note.key, service: note.service, actionID: action.id, mark: false)
-        } label: {
-            Text(CallUX.display(action))
-                .font(.caption)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 3)
-                .background(Capsule().fill(
-                    role == "accept" ? Color.green
-                        : role == "decline" || role == "hang" ? Color.red
-                        : Color.gray
-                ))
-                .foregroundStyle(role == "silence" ? Color.primary : Color.white)
-                .contentShape(Capsule())
+/// Avatar circle for a call: the caller's photo when the daemon saved one (CallData's
+/// `person_icon` is the caller), else the app's launcher icon, else a person glyph — the
+/// caller tiles on iOS.
+private struct CallAvatar: View {
+    let note: PhoneNotification
+    let size: CGFloat
+
+    var body: some View {
+        let photo = note.picture.flatMap {
+            FileManager.default.fileExists(atPath: $0) ? NSImage(contentsOfFile: $0) : nil
         }
-        .buttonStyle(.plain)
+        let appIcon = note.icon.flatMap {
+            FileManager.default.fileExists(atPath: $0) ? NSImage(contentsOfFile: $0) : nil
+        }
+        return ZStack(alignment: .center) {
+            Circle().fill(Color.secondary.opacity(0.15))
+                .frame(width: size, height: size)
+            if let photo {
+                Image(nsImage: photo)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: size, height: size)
+                    .clipShape(Circle())
+            } else if let appIcon {
+                Image(nsImage: appIcon)
+                    .resizable()
+                    .frame(width: size * 0.62, height: size * 0.62)
+                    .clipShape(RoundedRectangle(cornerRadius: size * 0.14, style: .continuous))
+            } else {
+                Image(systemName: "person.crop.circle.fill")
+                    .font(.system(size: size * 0.7))
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 }
 
@@ -325,6 +417,9 @@ final class DaemonClient: ObservableObject {
     /// The phone's ongoing call: a call notification that no longer carries an Answer action
     /// (Android re-shapes the same key after pick-up). Drives the ongoing-call indicators.
     @Published var ongoingCall: PhoneNotification?
+    /// The most recent ringing call notification (carries an Answer action): cleared when the
+    /// same key turns ongoing, when it is handled, or removed on the phone.
+    @Published var ringingCall: PhoneNotification?
     /// Bridge retention: enough for several days of typical notifications.
     private static let bridgeCapacity = 200
 
@@ -366,11 +461,15 @@ final class DaemonClient: ObservableObject {
     private func updateOngoingCall(_ note: PhoneNotification) {
         guard note.isCall == true else { return }
         if CallUX.isRinging(note) {
+            ringingCall = note
             if ongoingCall?.key == note.key {
                 ongoingCall = nil // ended, and the same key started ringing again
             }
         } else {
             ongoingCall = note
+            if ringingCall?.key == note.key {
+                ringingCall = nil // the pick-up came through
+            }
         }
     }
 
@@ -381,6 +480,9 @@ final class DaemonClient: ObservableObject {
         if key == ongoingCall?.key {
             ongoingCall = nil // call over: its notification was removed on the phone
         }
+        if key == ringingCall?.key {
+            ringingCall = nil
+        }
     }
 
     /// Per-row clear: forget the entry everywhere it is listed from.
@@ -389,6 +491,9 @@ final class DaemonClient: ObservableObject {
         hiddenKeys.insert(key)
         if key == ongoingCall?.key {
             ongoingCall = nil
+        }
+        if key == ringingCall?.key {
+            ringingCall = nil
         }
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [key])
     }
@@ -609,7 +714,9 @@ final class NotificationBridge: NSObject {
             body: body,
             replyable: frame.replyable == true,
             isCall: frame.isCall,
-            actions: frame.actions
+            actions: frame.actions,
+            picture: frame.picture,
+            icon: frame.icon
         ))
         let content = UNMutableNotificationContent()
         content.title = title
@@ -949,28 +1056,22 @@ struct MenuContent: View {
                 }
             }
 
-            // Ongoing-call indicator: shows while the phone has a call in progress, however it
-            // was picked up (on the phone or from the Mac); End hangs up through the call action.
-            if let call = daemon.ongoingCall {
-                HStack(spacing: 8) {
-                    Image(systemName: "phone.connection.fill")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.green)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(call.title).font(.caption).fontWeight(.medium).lineLimit(1)
-                        Text("Ongoing call").font(.caption2).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if let end = CallUX.first(call, "hang") {
-                        Button("End") {
-                            daemon.runAction(key: call.key, service: call.service, actionID: end.id, mark: false)
-                        }
-                        .controlSize(.small)
-                        .buttonStyle(.bordered)
-                    }
-                }
-                .padding(8)
-                .background(RoundedRectangle(cornerRadius: 10).fill(Color.green.opacity(0.12)))
+            // Call banner in the iPhone-calling style: ringing (Accept/Decline circles) or
+            // ongoing (End circle), however the call was picked up.
+            if let call = daemon.ringingCall {
+                CallCardView(note: call, compact: false)
+                    .padding(10)
+                    .background(RoundedRectangle(cornerRadius: 14)
+                        .fill(Color.green.opacity(0.10)))
+                    .overlay(RoundedRectangle(cornerRadius: 14)
+                        .strokeBorder(Color.green.opacity(0.35)))
+            } else if let call = daemon.ongoingCall {
+                CallCardView(note: call, compact: false)
+                    .padding(10)
+                    .background(RoundedRectangle(cornerRadius: 14)
+                        .fill(Color.secondary.opacity(0.08)))
+                    .overlay(RoundedRectangle(cornerRadius: 14)
+                        .strokeBorder(Color.primary.opacity(0.07)))
             }
 
             Picker("Panel", selection: _section.projectedValue) {
@@ -1465,9 +1566,9 @@ struct MenuNotificationsSection: View {
                     .buttonStyle(.plain)
                 } else {
                     if note.isCall == true {
-                        // Calls: Accept / Decline / Silence pills (End when ongoing) — the app
-                        // itself is never opened or streamed for a call notification.
-                        CallActionRow(note: note)
+                        // Calls: iPhone-calling card (avatar, name, round Accept/Decline/End)
+                        // — the app itself is never opened or streamed for a call notification.
+                        CallCardView(note: note, compact: true)
                     } else {
                         if note.replyable {
                             Button("Reply") {
@@ -1694,26 +1795,21 @@ struct PhoneView: View {
                 }
             }
 
-            // Ongoing call: green tile with an End button; same state the menu panel shows.
-            if let call = daemon.ongoingCall {
-                HStack(spacing: 12) {
-                    Image(systemName: "phone.connection.fill")
-                        .font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(.green)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(call.title).font(.headline).lineLimit(1)
-                        Text("Ongoing call").font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if let end = CallUX.first(call, "hang") {
-                        Button("End") {
-                            daemon.runAction(key: call.key, service: call.service, actionID: end.id, mark: false)
-                        }
-                        .controlSize(.small)
-                    }
-                }
-                .padding(10)
-                .background(RoundedRectangle(cornerRadius: 12).fill(Color.green.opacity(0.12)))
+            // Call card: iPhone-calling style. Ringing first (Accept/Decline), then ongoing (End).
+            if let call = daemon.ringingCall {
+                CallCardView(note: call, compact: false)
+                    .padding(12)
+                    .background(RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.green.opacity(0.10)))
+                    .overlay(RoundedRectangle(cornerRadius: 12)
+                        .strokeBorder(Color.green.opacity(0.35)))
+            } else if let call = daemon.ongoingCall {
+                CallCardView(note: call, compact: false)
+                    .padding(12)
+                    .background(RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.secondary.opacity(0.08)))
+                    .overlay(RoundedRectangle(cornerRadius: 12)
+                        .strokeBorder(Color.primary.opacity(0.07)))
             }
 
             HStack {
@@ -2048,7 +2144,7 @@ struct NotificationsView: View {
                     .buttonStyle(.link)
                 } else {
                     if note.isCall == true {
-                        CallActionRow(note: note)
+                        CallCardView(note: note, compact: true)
                     } else {
                         if note.replyable {
                             Button("Reply") {
