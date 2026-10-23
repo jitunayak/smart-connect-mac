@@ -541,7 +541,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
-        NSApp.setActivationPolicy(.accessory)
+        // Dock presence is a setting (Settings ✓ *Show SmartConnect in the Dock*): `.regular`
+        // gives the tile, `.accessory` hides it again. Applied here so it also holds when macOS
+        // re-launches the app at login.
+        if UserDefaults.standard.bool(forKey: "showInDock") {
+            NSApp.setActivationPolicy(.regular)
+        } else {
+            NSApp.setActivationPolicy(.accessory)
+        }
         DaemonClient.shared.start()
         NotificationBridge.shared.start()
         StreamHost.shared.start()
@@ -2259,6 +2266,14 @@ struct SettingsView: View {
         get { _launchAtLogin.wrappedValue }
         nonmutating set { _launchAtLogin.wrappedValue = newValue }
     }
+    private var _showInDock: State<Bool> = State(initialValue: UserDefaults.standard.bool(forKey: "showInDock"))
+    private var showInDock: Bool {
+        get { _showInDock.wrappedValue }
+        nonmutating set {
+            _showInDock.wrappedValue = newValue
+            UserDefaults.standard.set(newValue, forKey: "showInDock")
+        }
+    }
     private var _allTiles: State<Bool> = State(initialValue: UserDefaults.standard.bool(forKey: "allTiles"))
     private var allTiles: Bool {
         get { _allTiles.wrappedValue }
@@ -2284,6 +2299,16 @@ struct SettingsView: View {
                         }
                     }
                 if let error { Text(error).font(.caption).foregroundStyle(.red) }
+            }
+            Section("Appearance") {
+                Toggle("Show SmartConnect in the Dock", isOn: _showInDock.projectedValue)
+                    .onChange(of: showInDock) { on in
+                        // Takes effect immediately; also saved for the next launch.
+                        NSApp.setActivationPolicy(on ? .regular : .accessory)
+                    }
+                Text("When off, SmartConnect lives in the menu bar only (its current behaviour). When on, it also gets a Dock tile — closing the window then hides to the Dock instead of only the menu bar. The Dock icon also gives it a second way to reopen the window: clicking the tile.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("Experimental") {
                 Toggle("Advertise every phone feature tile", isOn: _allTiles.projectedValue)
