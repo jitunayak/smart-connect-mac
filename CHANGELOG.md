@@ -10,6 +10,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The READM
 
 ### Added
 
+- macOS app: `svc 15 cmd 21 audioAppList` (the phone-audio feature: "apps playing audio") is logged
+  as it arrives. Phone→PC audio cannot be implemented from this side yet: the requesting handshake
+  and the audio channel were never captured (the mirror track is video-only), and Android blocks
+  apps from grabbing telephony audio — call audio rides Bluetooth HFP (pair the phone with the Mac),
+  the way Windows' own Phone Link does it. (docs/usage.md → Audio ⋅ Phone audio on the PC.)
 - macOS app: **call notifications** show Accept / Decline / Silence pills in the notifications list
   and the same labelled buttons on the macOS banner; there is no Open for a call and banner taps do
   nothing, so the dialer is never streamed for a call. Once the call is picked up (Android reshapes

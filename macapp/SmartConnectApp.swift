@@ -3304,8 +3304,19 @@ final class StreamHost: NSObject, WKScriptMessageHandler, ObservableObject {
             mine?.learnDisplay(body)
         case 20:
             if let mine { cmd20FromPhone(session: mine, body: body) }
-        case 9, 10, 21, 26:
-            break // heartbeat, audio app list, resize result: informational
+        case 21:
+            // The phone's phone-audio feature (docs/protocol/app-streaming.md "cmd 21": apps
+            // playing audio). Windows streams media audio for this; call audio there rides
+            // Bluetooth HFP. No forwarding handshake was ever captured on the wire, so the PC
+            // cannot request it yet — log what the phone announces and keep watching.
+            if let list = body["audioAppList"] as? [[String: Any]], !list.isEmpty {
+                let pkgs = list.compactMap { $0["pkgName"] as? String ?? $0["pkg"] as? String }
+                NSLog("SmartConnect: stream: phone-audio: apps playing audio: \(pkgs)")
+            } else if body["audioAppList"] != nil {
+                NSLog("SmartConnect: stream: phone-audio: empty audio-app list (nothing playing)")
+            }
+        case 9, 10, 26:
+            break // heartbeat, heartbeat ack, resize result: informational
         default:
             break // 5/6 pause/resume and 17/26 resize are not part of this port yet
         }

@@ -671,6 +671,21 @@ With `--audio` (or *Send PC audio to the phone*), what the PC plays (the default
 is sent to the phone as Opus, and the audio switch in the phone's display toolbar mutes and unmutes it.
 The sound keeps playing on the PC too, with the phone slightly behind. If the PC's audio can't be
 captured, the session starts without it and you get a notification.
+
+### Phone audio on the PC (not implementable yet)
+
+Status: blocked, honestly
+
+The phone announces `svc 15 cmd 21 audioAppList` ("apps playing audio") on the wire, and Windows'
+Smart Connect streams that media audio to the PC — but the requesting handshake (how the PC asks
+for the forwarding, and on what channel the audio arrives) has never been captured here, and the
+mirror track is video-only. The app therefore only logs the list it receives (see `phone-audio`
+in `~/Library/Logs/SmartConnect/app.log`) as groundwork for the day a Windows-side capture
+produces the missing commands. Phone call audio specifically is not shorthand for media sharing:
+Android bars apps from capturing telephony audio, and Windows' own Phone Link does *calls* over
+**Bluetooth hands-free**, not over the link. Pairing the phone with the Mac over Bluetooth gives
+macOS an HFP device — call audio out of the Mac speakers and the Mac's mic back to the phone —
+which combines with the app's Accept pill and ongoing-call indicator.
 `SMARTCONNECT_DISPLAY_AUDIO_SRC` replaces the capture with your own GStreamer source description.
 
 ### Started from the phone
