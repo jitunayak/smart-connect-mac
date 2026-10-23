@@ -246,7 +246,14 @@ which apps it forwards.
   **Ongoing call** with a single red **End** circle; unknown dialer labels fall back to plain
   buttons as the phone sends them. The same card appears in the menu panel header and on the
   Phone page whenever the phone is ringing or in a call (never an Open, and banner taps do
-  nothing, so the dialer app is never streamed for a call). Call notifications don't enter the
+  nothing, so the dialer app is never streamed for a call). Call notifications skip the plain
+   system banner entirely — the floating card replaces it. Also, while the phone rings or is in
+   a call a **menu-bar call pill** appears in the status bar (red *Incoming* / green phone glyph
+   with a live timer, iOS's in-call pill); it opens a popover with the caller's avatar, name,
+   the dialer's detail line (caller ID) and a running timer, plus **Mute** (mutes the Mac's
+   default input — real mic mute for a call routed through the Mac over Bluetooth HFP),
+   **Speaker** (pushes the Mac's default output volume to maximum while on, restoring the
+   previous level when turned off) and **End** (Decline/Accept while ringing). Call notifications don't enter the
   WhatsApp-style "open the Mac app" rule. Clicking an action on any notification runs through the
   phone's app-stream invite answered **headlessly** (the same background-action behaviour the
   Linux host has: no window opens, the stream is released a beat after the intent fires).

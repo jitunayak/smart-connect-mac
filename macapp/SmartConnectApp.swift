@@ -7,6 +7,7 @@
 
 import AppKit
 import Combine
+import CoreAudio
 import CoreImage
 import CoreImage.CIFilterBuiltins
 import Foundation
@@ -500,6 +501,318 @@ private struct CallCardBackground: View {
             .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous)
                 .strokeBorder(edgeColor.opacity(0.55), lineWidth: 1))
             .shadow(color: .black.opacity(0.18), radius: 10, y: 3)
+    }
+}
+
+/// Local call-audio knobs for the menu-bar call popover: the HFP call mic lives on the Mac, so
+/// "Mute" is the default input device's mute; "Speaker" boosts the default output volume while
+/// active (loudspeaker-equivalent for a desktop).
+enum CallAudio {
+    /// The default device id for the in/out scope, or nil.
+    private static func defaultDevice(_ output: Bool) -> AudioDeviceID? {
+        var device: AudioDeviceID = 0
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: output ? kAudioHardwarePropertyDefaultOutputDevice
+                              : kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: 0)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                         &addr, 0, nil, &size, &device) == noErr,
+              device != 0 else { return nil }
+        return device
+    }
+
+    /// Reads the device mute with the scopes/elements real devices actually expose.
+    private static func muteState(_ output: Bool) -> Bool? {
+        guard let device = defaultDevice(output) else { return nil }
+        for element in [UInt32(0), UInt32(1), UInt32(2)] {
+            var muted: UInt32 = 0
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            var addr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyMute,
+                mScope: output ? kAudioDevicePropertyScopeOutput : kAudioDevicePropertyScopeInput,
+                mElement: element)
+            if AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &muted) == noErr {
+                return muted != 0
+            }
+        }
+        return nil
+    }
+
+    static func inputMuted() -> Bool { muteState(false) ?? false }
+    static func setInputMute(_ muted: Bool) -> Bool {
+        guard let device = defaultDevice(false) else { return false }
+        let value: UInt32 = muted ? 1 : 0
+        for element in [UInt32(0), UInt32(1), UInt32(2)] {
+            var addr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyMute,
+                mScope: kAudioDevicePropertyScopeInput, mElement: element)
+            var v = value
+            if AudioObjectSetPropertyData(device, &addr, 0, nil,
+                UInt32(MemoryLayout<UInt32>.size), &v) == noErr {
+                return true
+            }
+        }
+        return false
+    }
+
+    static func outputVolume() -> Float32? {
+        guard let device = defaultDevice(true) else { return nil }
+        for element in [UInt32(0), UInt32(1), UInt32(2)] {
+            var volume: Float32 = 0
+            var size = UInt32(MemoryLayout<Float32>.size)
+            var addr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioDevicePropertyScopeOutput, mElement: element)
+            if AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &volume) == noErr {
+                return volume
+            }
+        }
+        return nil
+    }
+
+    static func setOutputVolume(_ value: Float32) -> Bool {
+        guard let device = defaultDevice(true) else { return false }
+        var accepted = false
+        for element in [UInt32(0), UInt32(1), UInt32(2)] {
+            var addr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioDevicePropertyScopeOutput, mElement: element)
+            var v = value
+            if AudioObjectSetPropertyData(device, &addr, 0, nil,
+                UInt32(MemoryLayout<Float32>.size), &v) == noErr {
+                accepted = true
+            }
+        }
+        return accepted
+    }
+}
+
+/// The in-call device pill: while a call is ringing or ongoing a phone glyph with a live timer
+/// sits in the menu bar (iOS's green in-call pill). Clicking it opens the call popover with
+/// caller ID, the timer and Mute / Speaker / End (or Decline/Accept while ringing).
+@MainActor
+final class CallMenuBarController: NSObject {
+    static let shared = CallMenuBarController()
+    private var item: NSStatusItem?
+    private var popover: NSPopover?
+    private var timer: Timer?
+
+    enum CallMode { case ringing, ongoing }
+
+    func start() {
+        guard timer == nil else { return }
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            DispatchQueue.main.async { @MainActor in self?.refresh() }
+        }
+    }
+
+    private var currentMode: CallMode? {
+        let daemon = DaemonClient.shared
+        if daemon.ringingCall != nil { return .ringing }
+        if daemon.ongoingCall != nil { return .ongoing }
+        return nil
+    }
+
+    func refresh() {
+        let mode = currentMode
+        guard mode != nil else { return }
+        if mode == nil {
+            // Call over: close the popover and remove the pill.
+            if popover?.isShown == true { popover?.performClose(nil) }
+            popover = nil
+            if let item { NSStatusBar.system.removeStatusItem(item) }
+            item = nil
+            return
+        }
+        if item == nil {
+            let i = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            i.button?.title = ""
+            i.button?.image = nil
+            i.button?.target = self
+            i.button?.action = #selector(togglePopover(_:))
+            item = i
+            updateSizingAndTint(mode!)
+        }
+        updateSizingAndTint(mode!)
+        updateTitle(mode!)
+    }
+
+    private func updateSizingAndTint(_ mode: CallMode) {
+        guard let button = item?.button else { return }
+        let symbol = mode == .ringing ? "phone.badge.waveform.fill" : "phone.fill"
+        let tint = mode == .ringing ? NSColor.systemRed : NSColor.systemGreen
+        let config = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(config)
+        button.image = image
+        button.contentTintColor = tint
+        button.imagePosition = .imageLeading
+    }
+
+    private func updateTitle(_ mode: CallMode) {
+        guard let button = item?.button else { return }
+        let daemon = DaemonClient.shared
+        switch mode {
+        case .ringing:
+            button.title = "Incoming"
+        case .ongoing:
+            let since = daemon.ongoingCallSince ?? Date()
+            let elapsed = max(0, Int(Date().timeIntervalSince(since)))
+            button.title = "\(elapsed / 60):\(String(format: "%02d", elapsed % 60))"
+        }
+    }
+
+    @objc private func togglePopover(_ sender: Any?) {
+        guard let button = item?.button else { return }
+        if let popover, popover.isShown {
+            popover.performClose(nil)
+            return
+        }
+        guard currentMode != nil else { return }
+        let p = NSPopover()
+        p.behavior = .transient
+        p.contentViewController = NSHostingController(rootView:
+            CallMenuContent().environmentObject(DaemonClient.shared))
+        popover = p
+        p.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+    }
+}
+
+/// Call popover content inside the menu-bar pill: caller ID (name + the dialer's detail line),
+/// the running timer and Mute / Speaker / End — or Accept / Decline while it still rings.
+private struct CallMenuContent: View {
+    private var _daemon: EnvironmentObject<DaemonClient> = EnvironmentObject()
+    private var daemon: DaemonClient { _daemon.wrappedValue }
+    /// Local toggles reflect the Mac's audio devices when the call rides Bluetooth.
+    private var _mute: State<Bool> = State(initialValue: CallAudio.inputMuted())
+    private var mute: Bool {
+        get { _mute.wrappedValue }
+        nonmutating set { _mute.wrappedValue = newValue }
+    }
+    private var _loud: State<Bool> = State(initialValue: false)
+    private var loud: Bool {
+        get { _loud.wrappedValue }
+        nonmutating set { _loud.wrappedValue = newValue }
+    }
+    /// The output volume to put back when "Speaker" is switched off.
+    private var _restoreVolume: State<Float32?> = State(initialValue: nil)
+    private var restoreVolume: Float32? {
+        get { _restoreVolume.wrappedValue }
+        nonmutating set { _restoreVolume.wrappedValue = newValue }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let ringing = daemon.ringingCall {
+                header(ringing)
+                if let accept = CallUX.first(ringing, "accept") {
+                    HStack(spacing: 8) {
+                        wideChip("Decline", color: .red) {
+                            if let decline = CallUX.first(ringing, "decline") {
+                                daemon.runAction(key: ringing.key, service: ringing.service,
+                                                 actionID: decline.id, mark: false)
+                            }
+                        }
+                        wideChip("Accept", color: .green) {
+                            daemon.runAction(key: ringing.key, service: ringing.service,
+                                             actionID: accept.id, mark: false)
+                        }
+                    }
+                } else if let any = (ringing.actions ?? []).first(where: { !$0.reply }) {
+                    wideChip(any.name, color: .green) {
+                        daemon.runAction(key: ringing.key, service: ringing.service,
+                                         actionID: any.id, mark: false)
+                    }
+                }
+            } else if let call = daemon.ongoingCall {
+                header(call)
+                timerLine(call)
+                HStack(spacing: 8) {
+                    wideChip(mute ? "Muted" : "Mute",
+                             color: mute ? Color.secondary : Color.green,
+                             icon: mute ? "mic.slash.fill" : "mic.fill") {
+                        _ = CallAudio.setInputMute(!mute)
+                        mute = CallAudio.inputMuted()
+                    }
+                    wideChip(loud ? "Speaker ✓" : "Speaker", color: loud ? .secondary : .green,
+                             icon: "hifispeaker.2.fill") {
+                        if !loud {
+                            restoreVolume = CallAudio.outputVolume()
+                            _ = CallAudio.setOutputVolume(1.0)
+                        } else if let v = restoreVolume {
+                            _ = CallAudio.setOutputVolume(v)
+                        }
+                        loud.toggle()
+                    }
+                    if let end = CallUX.first(call, "hang") {
+                        wideChip("End", color: .red, icon: "phone.down.fill") {
+                            daemon.runAction(key: call.key, service: call.service,
+                                             actionID: end.id, mark: false)
+                        }
+                    }
+                }
+                Text("Mute silences the Mac's mic; Speaker pushes the Mac's volume to max while on.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(12)
+        .frame(width: 300)
+    }
+
+    private func header(_ call: PhoneNotification) -> some View {
+        HStack(spacing: 10) {
+            CallAvatar(note: call, size: 42)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(call.title)
+                    .font(.system(.body, design: .default, weight: .semibold))
+                    .lineLimit(1)
+                if !call.body.isEmpty {
+                    Text(call.body)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
+                    Text(call.app)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer()
+        }
+    }
+
+    private func timerLine(_ call: PhoneNotification) -> some View {
+        let since = daemon.ongoingCallSince ?? Date()
+        return TimelineView(.periodic(from: since, by: 1)) { _ in
+            let elapsed = max(0, Int(Date().timeIntervalSince(since)))
+            Text("Ongoing call · \(elapsed / 60):\(String(format: "%02d", elapsed % 60))")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func wideChip(_ label: String, color: Color, icon: String? = nil,
+                          action: @escaping () -> Void) -> some View {
+        Button {
+            action()
+        } label: {
+            HStack(spacing: 5) {
+                if let icon {
+                    Image(systemName: icon).font(.caption)
+                }
+                Text(label).font(.caption)
+            }
+            .foregroundStyle(color == .secondary ? Color.primary : .white)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .frame(maxWidth: .infinity)
+            .background(Capsule().fill(color))
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -1074,6 +1387,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // The persistent call bar watches the outgoing-call state; empty when no call, so it
         // can simply be started once at launch.
         CallPanelController.shared.start()
+        // The menu-bar in-call pill owns the same states (it shows nothing in the menu bar
+        // until a call is ringing or ongoing).
+        CallMenuBarController.shared.start()
         _ = ensureDaemonRunning()
 
         // A menu-bar-only app with no window is confusing on first launch. Show the main window

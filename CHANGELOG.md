@@ -10,6 +10,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The READM
 
 ### Added
 
+- macOS app: a **menu-bar call pill** while the phone is ringing or in a call — a status-bar item
+  (red Incoming / green phone glyph with a live timer, iOS's in-call pill) whose popover carries
+  the caller's avatar, name, the dialer's detail line (caller ID) and a running timer, plus
+  Mute (mutes the Mac's default input — real mic mute for Bluetooth-HFP-routed calls), Speaker
+  (pushes the Mac's default output volume to max while on, restoring the previous level), and
+  End (Decline/Accept while ringing). The floating call card also **replaces the plain system
+  banner for calls**: the ringing card (avatar, name, Silence link, red Decline + green Accept
+  circles) shows as a floating always-on-top card that morphs into the ongoing bar (live timer,
+  red End circle), and call notifications skip the UN banner entirely.
 - macOS app: call notifications are presented **iPhone-calling style** — round caller photo
   avatar (from the daemon's saved `person_icon`; launcher icon / person glyph as fallback), caller
   name and an Incoming call / Ongoing call status line, the round red Decline + green Accept
