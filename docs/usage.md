@@ -240,6 +240,14 @@ which apps it forwards.
 - **Open on phone** (🟡): clicking a notification that can't be replied to — or *Open on phone* in the
   GTK app's **⋯** menu — opens that app in its own window on the PC through
   [app streaming](#app-streaming), as on Windows.
+- **Mac apps take their notifications** (macOS app): when the notification's app also exists on the
+  Mac — WhatsApp, Telegram, Discord, Spotify, Slack, Teams, Outlook, Zoom or Instagram — **Open** in
+  the app's notifications list (and the macOS banner click, whose action button reads *Open on Mac*)
+  launches the installed Mac app instead of streaming the phone's copy. While that Mac app is
+  running, mirrored phone notifications for it are dropped entirely (no banner, nothing in the
+  list — the desktop app shows its own); quit the Mac app and the mirroring resumes. Unknown apps
+  still stream from the phone as before, and a bare `/Applications/<App name>.app` match makes the
+  behavior extend to apps beyond the built-in list.
 - **Dedupe and coalescing** (🟡): identical re-posts are dropped, and a notification that keeps
   changing (progress bars, timers, calls) updates the desktop at most once per second.
 - **App icons** (🟡): the phone's own launcher icon from the app-icon cache

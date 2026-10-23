@@ -10,6 +10,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The READM
 
 ### Added
 
+- macOS app: clicking a notification whose app also lives on the Mac (WhatsApp, Telegram, Discord,
+  Spotify, Slack, Teams, Outlook, Zoom, Instagram — or any app whose name matches an installed
+  `/Applications/<name>.app`) opens the local Mac app instead of streaming the phone's copy; the
+  banner's action button is relabelled *Open on Mac* for those. While the Mac app is running, the
+  phone's mirrored notifications for it are suppressed entirely (no banner, nothing in the list —
+  the desktop app already shows its own); quitting it resumes the mirroring. (OBSERVED: WhatsApp
+  `net.whatsapp.WhatsApp` installed and resolved both via the package map and name lookup; full
+  click flow pending a live notification.)
 - macOS app: the phone's app list is cached (`~/Library/Caches/SmartConnect/apps-cache.json`,
   written on every fresh service 17 `cmd 1`) and is shown instantly at launch and whenever a
   Streams surface opens — the panel no longer needs a manual Refresh before anything shows. Each

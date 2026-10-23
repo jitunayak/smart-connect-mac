@@ -136,6 +136,62 @@ struct PhoneNotification: Codable, Identifiable, Hashable {
     var id: String { key }
 }
 
+/// Phone apps that also exist as Mac apps: clicking such a notification opens the local app
+/// instead of streaming the phone's copy (WhatsApp being the one that matters most).
+enum MacAppCounterpart {
+    /// Phone package → macOS bundle identifier, for the pairs where guessing the bundle id
+    /// from the name is unreliable (Telegram, Slack, Teams all have past/present variants).
+    private static let pkgToMacBundleID: [String: String] = [
+        "com.whatsapp": "net.whatsapp.WhatsApp",
+        "org.telegram.messenger": "ru.keepcoder.Telegram",
+        "org.telegram.messenger.web": "ru.keepcoder.Telegram",
+        "com.discord": "com.hnc.Discord",
+        "com.spotify.music": "com.spotify.client",
+        "com.slack": "com.tinyspeck.slackmacgap",
+        "com.microsoft.teams": "com.microsoft.teams2",
+        "com.microsoft.office.outlook": "com.microsoft.Outlook",
+        "us.zoom.videomeetings": "us.zoom.xos",
+        "com.instagram.android": "com.burbn.instagram.mac",
+    ]
+
+    /// The installed Mac app that corresponds to this phone app, or nil when there is none.
+    /// Known bundle ids are tried by package name; otherwise the app label from the phone
+    /// ("WhatsApp") is matched against an installed `/Applications/<name>.app`.
+    static func macAppURL(app: String?, pkg: String?) -> URL? {
+        if let bid = pkg.flatMap({ pkgToMacBundleID[$0] }),
+           let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bid) {
+            return url
+        }
+        guard let name = app?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else {
+            return nil
+        }
+        for dir in ["/Applications", ("~/Applications" as NSString).expandingTildeInPath] {
+            let url = URL(fileURLWithPath: dir).appendingPathComponent("\(name).app")
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                return url
+            }
+        }
+        return nil
+    }
+
+    /// True when clicking this notification would open a local Mac app.
+    static func hasCounterpart(app: String?, pkg: String?) -> Bool {
+        macAppURL(app: app, pkg: pkg) != nil
+    }
+
+    /// True when the Mac counterpart is not merely installed but actually running — e.g. the
+    /// user has WhatsApp desktop open. That is the signal to stop mirroring that app's phone
+    /// notifications (quit the Mac app and the mirroring resumes).
+    static func counterpartRunning(app: String?, pkg: String?) -> Bool {
+        guard let url = macAppURL(app: app, pkg: pkg),
+              let bundleID = Bundle(url: url)?.bundleIdentifier else { return false }
+        return NSWorkspace.shared.runningApplications.contains {
+            $0.bundleURL == url || $0.bundleIdentifier == bundleID
+        }
+    }
+}
+
 struct PhoneStatus: Codable, DefaultConstructible {
     var connected = false
     var paired = false
@@ -321,8 +377,16 @@ final class DaemonClient: ObservableObject {
         }
     }
 
-    func openOnPhone(key: String, service: Int) {
+    /// Opens a notification on the phone — unless the same app also lives on this Mac
+    /// (WhatsApp and friends), in which case the local app is launched and the phone stays
+    /// untouched.
+    func openOnPhone(key: String, service: Int, app: String? = nil, pkg: String? = nil) {
         markHandled(key: key)
+        if let url = MacAppCounterpart.macAppURL(app: app, pkg: pkg) {
+            NSLog("SmartConnect: notifications: opening Mac app \(url.lastPathComponent) for \(pkg ?? app ?? key)")
+            NSWorkspace.shared.open(url)
+            return
+        }
         send(service: service, data: ["cmd": 0, "event": 2, "key": key, "version": "1.0"])
     }
 
@@ -408,6 +472,14 @@ final class NotificationBridge: NSObject {
             return
         }
         let app = frame.app ?? "Phone"
+        // The same app open on the Mac makes mirrored phone notifications redundant noise
+        // (WhatsApp desktop already shows its own): drop these before any banner or list.
+        if MacAppCounterpart.counterpartRunning(app: frame.app, pkg: frame.pkg) {
+            NSLog("SmartConnect: notifications: suppressing \(app) notification \(key) — its Mac app is open")
+            DaemonClient.shared.markHandled(key: key)
+            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [key])
+            return
+        }
         let title = (frame.title?.isEmpty == false ? frame.title! : app)
         let body = frame.body ?? ""
         DaemonClient.shared.note(PhoneNotification(
@@ -425,7 +497,7 @@ final class NotificationBridge: NSObject {
         content.body = body
         content.sound = .default
         content.threadIdentifier = key
-        content.userInfo = ["key": key, "service": frame.service ?? 5]
+        content.userInfo = ["key": key, "service": frame.service ?? 5, "app": app, "pkg": frame.pkg ?? ""]
         content.categoryIdentifier = registerCategory(for: frame)
 
         let attachmentPath = frame.picture ?? frame.icon
@@ -457,7 +529,13 @@ final class NotificationBridge: NSObject {
                 textInputPlaceholder: "Reply…"
             ))
         } else {
-            actions.append(UNNotificationAction(identifier: "open", title: "Open on phone", options: []))
+            actions.append(UNNotificationAction(
+                identifier: "open",
+                title: MacAppCounterpart.hasCounterpart(app: frame.app, pkg: frame.pkg)
+                    ? "Open on Mac" // the Mac app takes the click, not the streamed phone app
+                    : "Open on phone",
+                options: []
+            ))
         }
         for a in frame.actions ?? [] where !a.reply {
             actions.append(UNNotificationAction(identifier: "a\(a.id)", title: a.name, options: []))
@@ -486,13 +564,15 @@ extension NotificationBridge: UNUserNotificationCenterDelegate {
         let info = response.notification.request.content.userInfo
         let key = info["key"] as? String ?? ""
         let service = info["service"] as? Int ?? 5
+        let app = info["app"] as? String
+        let pkg = info["pkg"] as? String
         let action = response.actionIdentifier
         DispatchQueue.main.async {
             if action == "reply", let text = (response as? UNTextInputNotificationResponse)?.userText, !text.isEmpty {
                 DaemonClient.shared.reply(key: key, text: text)
                 DaemonClient.shared.markHandled(key: key)
             } else if action == UNNotificationDefaultActionIdentifier || action == "open" {
-                DaemonClient.shared.openOnPhone(key: key, service: service)
+                DaemonClient.shared.openOnPhone(key: key, service: service, app: app, pkg: pkg)
                 DaemonClient.shared.markHandled(key: key)
             } else if action.hasPrefix("a"), let id = Int(action.dropFirst()) {
                 DaemonClient.shared.runAction(key: key, service: service, actionID: id)
@@ -1212,7 +1292,7 @@ struct MenuNotificationsSection: View {
                         }
                         .buttonStyle(.link).font(.caption)
                     }
-                    Button("Open") { daemon.openOnPhone(key: note.key, service: note.service) }
+                    Button("Open") { daemon.openOnPhone(key: note.key, service: note.service, app: note.app, pkg: note.pkg) }
                         .buttonStyle(.link).font(.caption)
                 }
             }
@@ -1781,7 +1861,7 @@ struct NotificationsView: View {
                         .buttonStyle(.link)
                     }
                     Button("Open") {
-                        daemon.openOnPhone(key: note.key, service: note.service)
+                        daemon.openOnPhone(key: note.key, service: note.service, app: note.app, pkg: note.pkg)
                     }
                     .buttonStyle(.link)
                 }
