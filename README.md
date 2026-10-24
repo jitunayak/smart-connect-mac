@@ -287,6 +287,8 @@ assembles `build/SmartConnect.app`, ad-hoc signs it and (with `--install`) copie
 - A **Rust** toolchain (from <https://rustup.rs>) with `cargo` on `PATH`.
 - For the webcam: **GStreamer** (`brew install gstreamer libnice-gstreamer`) and **OBS Studio**
   (`brew install --cask obs`; start its virtual camera once so macOS enables the camera extension).
+  Without GStreamer, `build.sh` builds the app without the webcam helper; tapping Webcam on the
+  phone then shows the phone's "install the PC camera driver" message.
 - Same Wi-Fi network and subnet as the phone; inbound TCP 52020 and mDNS (UDP 5353) reachable on the
   Mac. macOS must be allowed to grant **Local Network** and **Bluetooth** access.
 

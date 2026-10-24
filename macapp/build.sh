@@ -5,8 +5,9 @@
 #   ./macapp/build.sh --run      # build and launch it
 #   ./macapp/build.sh --install  # copy to /Applications and launch it
 #
-# Requirements: Xcode Command Line Tools (swiftc), a Rust toolchain, and GStreamer for the webcam
-# helper (`brew install gstreamer libnice-gstreamer`).
+# Requirements: Xcode Command Line Tools (swiftc) and a Rust toolchain. The webcam helper is built
+# too when GStreamer is installed (`brew install gstreamer libnice-gstreamer`); without it the app
+# is built without the webcam.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,8 +40,19 @@ command -v swiftc >/dev/null || { echo "swiftc not found (install Xcode Command 
 
 mkdir -p "$BUILD_DIR"
 
-echo "==> building smartconnectd + smartconnect-webcam (release)"
-cargo build --release -p smartconnect-mac -p smartconnect-webcam
+WEBCAM=0
+if command -v pkg-config >/dev/null && pkg-config --exists gstreamer-webrtc-1.0 gstreamer-sdp-1.0; then
+    WEBCAM=1
+fi
+
+echo "==> building smartconnectd (release)"
+cargo build --release -p smartconnect-mac
+if [ "$WEBCAM" = 1 ]; then
+    echo "==> building smartconnect-webcam (release)"
+    cargo build --release -p smartconnect-webcam
+else
+    echo "==> skipping smartconnect-webcam: GStreamer not found (brew install gstreamer libnice-gstreamer)"
+fi
 
 echo "==> building Swift helper"
 swiftc -O -swift-version 5 -target "$TARGET" \
@@ -59,7 +71,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BUILD_DIR/$APP_NAME" "$APP/Contents/MacOS/$APP_NAME"
 cp target/release/smartconnectd "$APP/Contents/MacOS/smartconnectd"
-cp target/release/smartconnect-webcam "$APP/Contents/MacOS/smartconnect-webcam"
+[ "$WEBCAM" = 1 ] && cp target/release/smartconnect-webcam "$APP/Contents/MacOS/smartconnect-webcam"
 cp "$BUILD_DIR/smartconnect-mac-helper" "$APP/Contents/MacOS/smartconnect-mac-helper"
 chmod +x "$APP/Contents/MacOS/"*
 cp macapp/Info.plist "$APP/Contents/Info.plist"
@@ -71,7 +83,9 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 echo "==> signing (ad-hoc)"
 codesign --force --sign - --identifier "$BUNDLE_ID.helper" "$APP/Contents/MacOS/smartconnect-mac-helper"
 codesign --force --sign - --identifier "$BUNDLE_ID.daemon" "$APP/Contents/MacOS/smartconnectd"
-codesign --force --sign - --identifier "$BUNDLE_ID.webcam" "$APP/Contents/MacOS/smartconnect-webcam"
+if [ "$WEBCAM" = 1 ]; then
+    codesign --force --sign - --identifier "$BUNDLE_ID.webcam" "$APP/Contents/MacOS/smartconnect-webcam"
+fi
 codesign --force --sign - --identifier "$BUNDLE_ID" "$APP"
 codesign --verify --deep --strict "$APP"
 
