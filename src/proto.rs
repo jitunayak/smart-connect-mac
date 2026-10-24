@@ -48,12 +48,13 @@ fn caps_with_extra(extra: &[(String, i64)]) -> Value {
 fn caps_with(extra: &[(String, i64)], all_tiles: bool) -> Value {
     // Only advertise tiles this build can actually answer. The macOS port implements app
     // streaming + Screen share (1, 15, answered by the WKWebView stream host in the menu-bar
-    // app), clipboard text sync (9), PC lock (22) and the hotspot bridge (13); webcam
-    // (3) and cross control (26) helpers are not part of this release, so those tiles stay
-    // hidden unless the user opts in with --extra-tiles or --all-tiles. Advertised-but-not-yet-
-    // verified tiles just make a tap wait ~20 s on the phone and time out.
+    // app), clipboard text sync (9), PC lock (22), the hotspot bridge (13) and the webcam (3,
+    // answered by the bundled `smartconnect-webcam` helper); the cross control (26) helper is not
+    // part of this release, so that tile stays hidden unless the user opts in with --extra-tiles
+    // or --all-tiles. Advertised-but-not-yet-verified tiles just make a tap wait ~20 s on the
+    // phone and time out.
     #[cfg(target_os = "macos")]
-    let mut cap = json!({ "1": 1, "9": 1, "13": 1, "15": 1, "22": 1 });
+    let mut cap = json!({ "1": 1, "3": 1, "9": 1, "13": 1, "15": 1, "22": 1 });
     #[cfg(not(target_os = "macos"))]
     let mut cap = json!({ "3": 1, "13": 1, "15": 1, "22": 1, "26": 1 });
     if let Some(map) = cap.as_object_mut() {
@@ -221,10 +222,10 @@ mod tests {
         let both = caps_with(&[("13".to_string(), 8)], true);
         assert_eq!(both["13"], 8);
         assert_eq!(both["26"], 1);
-        // Without the flag the *helper* services stay hidden (1 and 15 are advertised by
-        // default on macOS: the menu-bar app's stream host answers them).
+        // Without the flag unanswered services stay hidden (1 and 15 are advertised by default
+        // on macOS: the menu-bar app's stream host answers them; 3 by the webcam helper).
         let off = caps_with(&[], false);
-        assert!(off.get("3").is_none());
+        assert_eq!(off["3"], 1, "svc 3 is on by default (smartconnect-webcam)");
         assert!(off.get("26").is_none());
         assert_eq!(off["1"], 1, "svc 1 is on by default (stream host in the app)");
         assert_eq!(off["15"], 1, "svc 15 is on by default (stream host in the app)");

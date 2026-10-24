@@ -11,12 +11,18 @@
 //   ble-wake --frame B64 --ids JSON
 //                              scan for a paired phone, connect and write the invite
 //   ble-watch-power            print {"event":"poweredOn"} whenever Bluetooth turns on
+//   camera-feed --width W --height H [--device-uid UID]
+//                              raw BGRA frames on stdin → the camera extension's sink stream
+//                              (default: OBS Virtual Camera), so every app sees the phone camera
 //
 // Build with -Xlinker -sectcreate __TEXT __info_plist HelperInfo.plist so CoreBluetooth has the
 // usage description macOS requires.
 
 import AppKit
 import CoreBluetooth
+import CoreMedia
+import CoreMediaIO
+import CoreVideo
 import CoreGraphics
 import CryptoKit
 import Foundation
@@ -343,11 +349,140 @@ func bleWatchPower() -> Never {
     exit(0)
 }
 
+// MARK: - Camera feed (phone webcam → a CoreMediaIO camera extension's sink stream)
+
+/// The OBS Virtual Camera extension's device id (OBS's `mac-virtualcam` plug-in, key
+/// `OBSCameraDeviceUUID`). Used when OBS.app isn't where we look for it.
+let obsCameraDeviceUUID = "7626645E-4425-469E-9D8B-97E0FA59AC75"
+
+func cmioProperty<T>(_ object: CMIOObjectID, _ selector: Int, _ type: T.Type) -> [T] {
+    var address = CMIOObjectPropertyAddress(
+        mSelector: CMIOObjectPropertySelector(selector),
+        mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+        mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+    var size: UInt32 = 0
+    guard CMIOObjectGetPropertyDataSize(object, &address, 0, nil, &size) == noErr, size > 0 else { return [] }
+    let count = Int(size) / MemoryLayout<T>.stride
+    let buffer = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: MemoryLayout<T>.alignment)
+    defer { buffer.deallocate() }
+    var used: UInt32 = 0
+    guard CMIOObjectGetPropertyData(object, &address, 0, nil, size, &used, buffer) == noErr else { return [] }
+    return (0..<count).map { buffer.load(fromByteOffset: $0 * MemoryLayout<T>.stride, as: T.self) }
+}
+
+func cmioDeviceUID(_ device: CMIOObjectID) -> String? {
+    var address = CMIOObjectPropertyAddress(
+        mSelector: CMIOObjectPropertySelector(kCMIODevicePropertyDeviceUID),
+        mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+        mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+    var uid: Unmanaged<CFString>?
+    var used: UInt32 = 0
+    let size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    guard CMIOObjectGetPropertyData(device, &address, 0, nil, size, &used, &uid) == noErr else { return nil }
+    return uid?.takeRetainedValue() as String?
+}
+
+/// `camera-feed --width W --height H [--device-uid UID]`: reads raw BGRA frames (W*H*4 bytes
+/// each) from stdin and enqueues them on the camera extension's sink stream, so every app that
+/// opens that camera sees the phone. Prints {"event":"ready"} once the sink runs; exits when
+/// stdin closes. Allowing the queue to be filled needs the Camera permission (TCC).
+func cameraFeed(width: Int, height: Int, deviceUID: String) -> Never {
+    // Let CoreMediaIO see camera-extension devices from this process.
+    var allow: UInt32 = 1
+    var allowAddress = CMIOObjectPropertyAddress(
+        mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyAllowScreenCaptureDevices),
+        mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+        mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+    CMIOObjectSetPropertyData(CMIOObjectID(kCMIOObjectSystemObject), &allowAddress, 0, nil,
+                              UInt32(MemoryLayout<UInt32>.size), &allow)
+
+    let wanted = deviceUID.uppercased()
+    var device: CMIOObjectID?
+    let deadline = Date().addingTimeInterval(5)
+    while device == nil && Date() < deadline {
+        device = cmioProperty(CMIOObjectID(kCMIOObjectSystemObject), kCMIOHardwarePropertyDevices, CMIOObjectID.self)
+            .first { cmioDeviceUID($0)?.uppercased() == wanted }
+        if device == nil { RunLoop.current.run(until: Date().addingTimeInterval(0.2)) }
+    }
+    guard let device else {
+        fail("camera-feed: camera \(deviceUID) not found (is OBS installed and its virtual camera enabled once?)")
+    }
+    // The extension's streams: [source, sink]; frames go to the sink.
+    let streams = cmioProperty(device, kCMIODevicePropertyStreams, CMIOStreamID.self)
+    guard streams.count >= 2 else { fail("camera-feed: the camera has no sink stream") }
+    let sink = streams[1]
+
+    var queueRef: Unmanaged<CMSimpleQueue>?
+    let status = CMIOStreamCopyBufferQueue(sink, { _, _, _ in }, nil, &queueRef)
+    guard status == noErr, let queue = queueRef?.takeRetainedValue() else {
+        fail("camera-feed: can't open the sink queue (\(status)); allow Camera access for Smart Connect")
+    }
+    let started = CMIODeviceStartStream(device, sink)
+    guard started == noErr else { fail("camera-feed: can't start the sink stream (\(started))") }
+
+    var format: CMVideoFormatDescription?
+    CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault, codecType: kCVPixelFormatType_32BGRA,
+                                   width: Int32(width), height: Int32(height), extensions: nil,
+                                   formatDescriptionOut: &format)
+    let attributes: NSDictionary = [
+        kCVPixelBufferWidthKey: width,
+        kCVPixelBufferHeightKey: height,
+        kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+        kCVPixelBufferIOSurfacePropertiesKey: [CFString: CFTypeRef](),
+    ]
+    var pool: CVPixelBufferPool?
+    CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attributes, &pool)
+    guard let format, let pool else { fail("camera-feed: can't create the pixel buffer pool") }
+
+    signal(SIGPIPE, SIG_IGN)
+    emit(["event": "ready", "width": width, "height": height])
+    let frameBytes = width * height * 4
+    let frame = UnsafeMutablePointer<UInt8>.allocate(capacity: frameBytes)
+    defer { frame.deallocate() }
+    let input = FileHandle.standardInput.fileDescriptor
+    while true {
+        var got = 0
+        while got < frameBytes {
+            let n = read(input, frame + got, frameBytes - got)
+            if n <= 0 {
+                CMIODeviceStopStream(device, sink)
+                exit(0)
+            }
+            got += n
+        }
+        // Drop the frame when the extension is behind instead of growing a backlog.
+        if CMSimpleQueueGetCount(queue) >= CMSimpleQueueGetCapacity(queue) { continue }
+        var pixelBuffer: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer) == kCVReturnSuccess,
+              let pixelBuffer else { continue }
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        let dst = CVPixelBufferGetBaseAddress(pixelBuffer)!.assumingMemoryBound(to: UInt8.self)
+        let dstRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let srcRow = width * 4
+        for row in 0..<height {
+            memcpy(dst + row * dstRow, frame + row * srcRow, srcRow)
+        }
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 30),
+                                        presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
+                                        decodeTimeStamp: .invalid)
+        var sample: CMSampleBuffer?
+        CMSampleBufferCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer,
+                                           dataReady: true, makeDataReadyCallback: nil, refcon: nil,
+                                           formatDescription: format, sampleTiming: &timing,
+                                           sampleBufferOut: &sample)
+        if let sample {
+            // The queue takes over this retain; the extension releases the buffer.
+            CMSimpleQueueEnqueue(queue, element: Unmanaged.passRetained(sample).toOpaque())
+        }
+    }
+}
+
 // MARK: - Entry point
 
 let args = Array(CommandLine.arguments.dropFirst())
 guard let command = args.first else {
-    fail("usage: smartconnect-mac-helper <pasteboard-watch|pasteboard-copy|lock-screen|session-locked|session-locked-wait|ble-advertise|ble-wake|ble-watch-power>")
+    fail("usage: smartconnect-mac-helper <pasteboard-watch|pasteboard-copy|lock-screen|session-locked|session-locked-wait|ble-advertise|ble-wake|ble-watch-power|camera-feed>")
 }
 
 func option(_ name: String) -> String? {
@@ -369,5 +504,9 @@ case "ble-wake":
     let timeout = TimeInterval(option("--timeout") ?? "35") ?? 35
     bleWake(frameBase64: frame, idsJSON: ids, timeout: timeout)
 case "ble-watch-power": bleWatchPower()
+case "camera-feed":
+    let width = Int(option("--width") ?? "1920") ?? 1920
+    let height = Int(option("--height") ?? "1080") ?? 1080
+    cameraFeed(width: width, height: height, deviceUID: option("--device-uid") ?? obsCameraDeviceUUID)
 default: fail("unknown command \(command)")
 }

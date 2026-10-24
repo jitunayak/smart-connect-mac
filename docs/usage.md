@@ -721,6 +721,43 @@ or fails within 20 s, the daemon tells the phone to stop waiting. The helper's o
 Status: ✅ verified on a phone (including switching between the front and back camera); the quality
 setting is 🟡 not verified yet
 
+### On macOS
+
+Status: ✅ verified on a phone (edge 70 fusion): the camera in a window, and as the OBS Virtual
+Camera read back through AVFoundation (how every app reads cameras).
+
+The phone's camera becomes a camera every Mac app can pick, named **OBS Virtual Camera**:
+
+1. Install GStreamer and OBS once: `brew install gstreamer libnice-gstreamer` and
+   `brew install --cask obs`. Open OBS once and click **Start Virtual Camera** so macOS enables its
+   camera extension (approve it in System Settings if asked). After that OBS doesn't need to run.
+2. Start the webcam: tap **Webcam** on the Mac's device page in Smart Connect on the phone, or click
+   **Webcam** in the menu panel's phone card.
+3. In FaceTime, Zoom, Meet, Teams, a browser…, pick **OBS Virtual Camera**. Without a session it
+   shows OBS's placeholder picture.
+4. While it runs, the menu panel shows **front/back**, **light** and **zoom** controls and
+   **Stop webcam**. Stopping on the phone works too.
+
+How it works: the bundled `smartconnect-webcam` decodes the phone's H.264 with VideoToolbox, scales
+it to the camera's 1920x1080 BGRA format and pipes it to `smartconnect-mac-helper camera-feed`,
+which enqueues the frames on the OBS camera extension's sink stream, the same way OBS does. The
+session log is `~/Library/Logs/SmartConnect/smartconnect-webcam.log`.
+
+- `smartconnect-webcam --check` (in `SmartConnect.app/Contents/MacOS/`) shows the camera feed and
+  the GStreamer elements; `--test-pattern 10` sends colour bars into the camera, no phone needed.
+- `--output window` shows the camera in a window instead (debugging); closing the window stops the
+  session.
+- `SMARTCONNECT_CAMERA_UID` feeds another camera extension that has a sink stream (for example your
+  own, signed one) instead of OBS's; `SMARTCONNECT_MAC_HELPER_BIN` points at the feeder.
+- The quality preset is read from `~/Library/Application Support/SmartConnect/webcam.json`.
+- Not possible on top of OBS's camera: a camera with its own name (needs our own camera extension,
+  which macOS only loads when signed with a paid Apple Developer account), and pausing the stream
+  while no app uses the camera (only the extension can see its readers; neither CoreMediaIO's
+  running-somewhere flag nor AVFoundation's in-use flag reports them, OBSERVED).
+- Smart Connect's USB connection mode is not supported; use Wi-Fi.
+
+### On Linux
+
 `smartconnect-webcam` makes the phone's camera available as a Linux webcam. The phone streams H.264
 over WebRTC straight to the helper, which decodes it to 1280x720 YUY2 at 30 fps. The frames go to a
 `v4l2loopback` device, so every V4L2 app sees a camera, or, when no loopback device exists, to a

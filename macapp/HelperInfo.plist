@@ -2,19 +2,21 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleIdentifier</key>
-    <string>app.smartconnect.mac.helper</string>
-    <key>CFBundleName</key>
-    <string>SmartConnect Helper</string>
-    <key>CFBundleExecutable</key>
-    <string>smartconnect-mac-helper</string>
-    <key>NSBluetoothAlwaysUsageDescription</key>
-    <string>Smart Connect uses Bluetooth to wake your paired phone and to offer the ReadyFor pairing service.</string>
-    <key>NSBluetoothPeripheralUsageDescription</key>
-    <string>Smart Connect offers the ReadyFor pairing service to your phone.</string>
-    <key>NSCalendarsUsageDescription</key>
-    <string>Smart Connect does not read your calendar.</string>
-    <key>LSBackgroundOnly</key>
-    <true/>
+	<key>CFBundleExecutable</key>
+	<string>smartconnect-mac-helper</string>
+	<key>CFBundleIdentifier</key>
+	<string>app.smartconnect.mac.helper</string>
+	<key>CFBundleName</key>
+	<string>SmartConnect Helper</string>
+	<key>LSBackgroundOnly</key>
+	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Smart Connect uses Bluetooth to wake your paired phone and to offer the ReadyFor pairing service.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>Smart Connect offers the ReadyFor pairing service to your phone.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>Smart Connect does not read your calendar.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Smart Connect shows your phone camera as a Mac camera.</string>
 </dict>
 </plist>
