@@ -6,7 +6,7 @@ license = "MIT"
 description = "smartconnectd for macOS: unofficial peer for the Motorola Smart Connect phone app (pairing, sessions, notifications, clipboard, SMS, control socket)"
 
 [workspace]
-members = ["fex"]
+members = ["fex", "webcam"]
 resolver = "3"
 
 [dependencies]

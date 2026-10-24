@@ -5,7 +5,8 @@
 #   ./macapp/build.sh --run      # build and launch it
 #   ./macapp/build.sh --install  # copy to /Applications and launch it
 #
-# Requirements: Xcode Command Line Tools (swiftc) and a Rust toolchain.
+# Requirements: Xcode Command Line Tools (swiftc), a Rust toolchain, and GStreamer for the webcam
+# helper (`brew install gstreamer libnice-gstreamer`).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,8 +37,10 @@ fi
 command -v cargo >/dev/null || { echo "cargo not found (install Rust from https://rustup.rs)" >&2; exit 1; }
 command -v swiftc >/dev/null || { echo "swiftc not found (install Xcode Command Line Tools)" >&2; exit 1; }
 
-echo "==> building smartconnectd (release)"
-cargo build --release
+mkdir -p "$BUILD_DIR"
+
+echo "==> building smartconnectd + smartconnect-webcam (release)"
+cargo build --release -p smartconnect-mac -p smartconnect-webcam
 
 echo "==> building Swift helper"
 swiftc -O -swift-version 5 -target "$TARGET" \
@@ -56,6 +59,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BUILD_DIR/$APP_NAME" "$APP/Contents/MacOS/$APP_NAME"
 cp target/release/smartconnectd "$APP/Contents/MacOS/smartconnectd"
+cp target/release/smartconnect-webcam "$APP/Contents/MacOS/smartconnect-webcam"
 cp "$BUILD_DIR/smartconnect-mac-helper" "$APP/Contents/MacOS/smartconnect-mac-helper"
 chmod +x "$APP/Contents/MacOS/"*
 cp macapp/Info.plist "$APP/Contents/Info.plist"
@@ -67,6 +71,7 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 echo "==> signing (ad-hoc)"
 codesign --force --sign - --identifier "$BUNDLE_ID.helper" "$APP/Contents/MacOS/smartconnect-mac-helper"
 codesign --force --sign - --identifier "$BUNDLE_ID.daemon" "$APP/Contents/MacOS/smartconnectd"
+codesign --force --sign - --identifier "$BUNDLE_ID.webcam" "$APP/Contents/MacOS/smartconnect-webcam"
 codesign --force --sign - --identifier "$BUNDLE_ID" "$APP"
 codesign --verify --deep --strict "$APP"
 

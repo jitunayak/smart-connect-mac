@@ -232,6 +232,29 @@ PC → phone, acted on when `data.cmd` is 0 or 1 (OBSERVED, phone app):
 - It sends `cmd 13` every 10 s and offers only UDP IPv4 candidates on the phone's /24 (taken from the
   start message's `url`).
 
+### macOS port
+
+- Same helper and signalling. Output: decoded frames are scaled to 1920x1080 BGRA (the OBS Virtual
+  Camera extension's only format) and piped to `smartconnect-mac-helper camera-feed`, which enqueues
+  them on the extension's sink stream (second stream of the device, `CMIOStreamCopyBufferQueue` +
+  `CMIODeviceStartStream`), as OBS's own `mac-virtualcam` plug-in does (OBSERVED, OBS source and a
+  read-back through AVFoundation).
+- The daemon advertises tile 3 by default on macOS and starts the bundled helper on the phone's
+  request.
+
+## The `lite` flag
+
+`lite` in the phone's `cmd 0` is decided on the phone, not negotiated (OBSERVED, phone app): the
+phone sends `lite: 0` (Motorola's dedicated desktop-camera app, with more controls) only when the
+system property `ro.product.motcameradesktop` is `1`, that app's start-webcam activity is installed,
+and the device codename is not on a short exclusion list. Phones without the property (for example
+the edge 70 fusion, which has `ro.product.motodesktop=1` but not `ro.product.motcameradesktop`)
+always send `lite: 1`, to Windows as well, so nothing a PC sends unlocks the dedicated camera app.
+
+Fields the phone reads from a PC `cmd 0`/`cmd 1` (OBSERVED, phone app's data class):
+`capture_enable`, `heartbeat`, `isReply`, `loop_toggle`, `maxL`, `minL`, `port`, `sensitivity`,
+`size`, `state`, `supportedMediaFormat` (default 1) and `supportedWebRTC` (default 0).
+
 ## Pitfalls
 
 1. **`isReply` must be absent** in a PC-initiated `cmd 0`; the phone tells request and reply apart by

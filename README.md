@@ -141,7 +141,8 @@ its protocol work with the Linux project, so details on each service live in the
 |---|---|---|
 | PC lock tile | ✅ | Locks the session through the helper (screen-lock state is streamed so the phone's tile updates). |
 | Hotspot tile | 🟡 | The phone starts a hotspot with PC-chosen credentials. |
-| Webcam, Cross Control, phone as a display | ❌ | Linux-only features; not implemented on macOS. |
+| Webcam tile (phone camera as a Mac camera) | ✅ | Verified: the phone's camera shows up as **OBS Virtual Camera** in every app (FaceTime, Zoom, browsers…), 1280×720 at 30 fps scaled to 1920×1080. Needs GStreamer and OBS installed (OBS doesn't have to run). Start it from the tile or the menu panel's **Webcam** button; front/back, light and zoom from the panel. See [docs/usage.md](docs/usage.md#phone-as-a-webcam). |
+| Cross Control, phone as a display | ❌ | Linux-only features; not implemented on macOS. |
 
 </details>
 
@@ -284,6 +285,8 @@ assembles `build/SmartConnect.app`, ad-hoc signs it and (with `--install`) copie
 - macOS 13.0 or newer on Apple Silicon (the app targets `arm64-apple-macosx13.0`).
 - Xcode **Command Line Tools** (for `swiftc`).
 - A **Rust** toolchain (from <https://rustup.rs>) with `cargo` on `PATH`.
+- For the webcam: **GStreamer** (`brew install gstreamer libnice-gstreamer`) and **OBS Studio**
+  (`brew install --cask obs`; start its virtual camera once so macOS enables the camera extension).
 - Same Wi-Fi network and subnet as the phone; inbound TCP 52020 and mDNS (UDP 5353) reachable on the
   Mac. macOS must be allowed to grant **Local Network** and **Bluetooth** access.
 
@@ -356,10 +359,14 @@ Protocol pages by service:
 
 - **Only one phone at a time.** The daemon pairs and connects a single phone; disconnect it before
   pairing another.
-- **Webcam, Cross Control and phone-as-a-display are not implemented on macOS.** Those features
-  live in the Linux project. The tiles can still be advertised (they time out on the phone).
-- **The webcam and image/file clipboard are not available.** Text clipboard sync works both ways;
-  images and files are not fetched yet.
+- **Cross Control and phone-as-a-display are not implemented on macOS.** Those features live in
+  the Linux project. The tiles can still be advertised (they time out on the phone).
+- **The webcam appears as "OBS Virtual Camera".** A camera with its own name needs our own
+  CoreMediaIO camera extension, which macOS only loads when signed by a paid Apple Developer
+  account; the OBS extension is already signed, so this port feeds that one. For the same reason
+  the stream isn't paused while no app uses the camera (only the extension itself can see that).
+- **Image/file clipboard is not available.** Text clipboard sync works both ways; images and files
+  are not fetched yet.
 - **PC audio on the phone is not implemented.** Call audio rides Bluetooth HFP instead.
 - **Messaging notifications show the app icon, not the sender's picture**, because the phone sends
   only its owner's picture for a chat.

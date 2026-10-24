@@ -8,7 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The READM
 
 ## [Unreleased]
 
+### Fixed
+
+- `macapp/build.sh` failed on a fresh clone (the `build/` directory didn't exist yet).
+
 ### Added
+
+- macOS: **phone as a webcam**. The Webcam tile is advertised by default; tapping it (or the menu panel's new **Webcam** button) streams the phone camera into the **OBS Virtual Camera**, so every Mac app can pick it, without OBS running or a window. The `smartconnect-webcam` helper is ported (VideoToolbox decoding, macOS paths, `--output camera|window`) and bundled; the new `smartconnect-mac-helper camera-feed` feeds the camera extension's sink stream. Front/back, light and zoom controls in the panel. Needs GStreamer and OBS (see Requirements).
 
 - macOS app: **update checks against the project's GitHub releases** — Settings ✓ *Updates* shows the copy you run, the latest release from GitHub's `releases/latest` (so drafts and pre-releases never count) and a **Check for Updates** button reporting "up to date" (with when it was checked), a newer tag (name, publication date, *View release* opens the release page in the browser) or why the check failed (offline, rate-limited, no release published yet). A silent launch check runs a few seconds after start and posts a one-time *"SmartConnect vX is available"* notification for a tag not announced before (remembered in defaults, so the same version never nags twice); its click opens the release page rather than anything on the phone. Version comparison is numeric per dot-part with missing parts 0 (`0.10.0` > `0.9.0`, `v0.1.0-beta` equals `0.1.0`).
 - macOS app: **Download and Install** — the same Updates page updates in place. The release's disk image (first `.dmg` asset, byte count checked against what the release advertises) is downloaded with progress and a **Cancel**, then handed to `update.sh` in the state folder: it waits for the running copy to exit, mounts the image read-only, `ditto`s the new bundle beside the old one, swaps it, strips the download's quarantine and starts the new version, then logs `installed <ver>` to `update.log`. Where the folder the app lives in isn't writable by this user, the identical script runs through one administrator prompt (its uid argument puts the new copy back in the login session, not as root). Failures the window can no longer show are pushed as a notification, and the relaunch button is kept for a release without an image (`View release`). Settings and pairing state live in the state folder and survive; `--self-test-update` builds a disk image of the copy running and offers it, so the whole path can be exercised without publishing a release.

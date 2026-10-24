@@ -1835,6 +1835,10 @@ struct MenuPhoneSection: View {
                 Text(message).font(.caption).foregroundStyle(.secondary).lineLimit(2)
             }
 
+            if daemon.status?.connected == true {
+                WebcamControls()
+            }
+
             ForEach(host.streamList, id: \.sid) { s in
                 HStack(spacing: 8) {
                     Image(systemName: "rectangle.inset.bottomleft.filled").foregroundStyle(.secondary)
@@ -1871,6 +1875,145 @@ struct MenuPhoneSection: View {
             }
         }
         .onAppear { host.requestAppsIfStale() }
+    }
+}
+
+/// Drives the bundled `smartconnect-webcam` CLI: a session (started here or by the phone's Webcam
+/// tile, which the daemon answers) feeds the phone camera into the OBS Virtual Camera; the camera
+/// commands are relayed to the phone through the daemon.
+final class WebcamController: ObservableObject {
+    static let shared = WebcamController()
+
+    @Published private(set) var running = false
+    @Published private(set) var zoom = 0
+    @Published var message: String?
+    private var timer: Timer?
+    /// The phone's in-app camera reports `zoom.max` 8 (docs/protocol/webcam.md).
+    let maxZoom = 8
+
+    private var binary: String {
+        let bundled = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/smartconnect-webcam").path
+        return FileManager.default.isExecutableFile(atPath: bundled) ? bundled : "smartconnect-webcam"
+    }
+
+    /// Same file the helper locks (`$TMPDIR/smartconnect/smartconnect-webcam.lock`).
+    private var lockPath: String {
+        let tmp = ProcessInfo.processInfo.environment["TMPDIR"] ?? NSTemporaryDirectory()
+        return URL(fileURLWithPath: tmp).appendingPathComponent("smartconnect/smartconnect-webcam.lock").path
+    }
+
+    func startPolling() {
+        refresh()
+        guard timer == nil else { return }
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+    }
+
+    func stopPolling() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    /// A running session holds an exclusive flock on the lock file.
+    func refresh() {
+        let fd = open(lockPath, O_RDONLY)
+        var held = false
+        if fd >= 0 {
+            held = flock(fd, LOCK_SH | LOCK_NB) != 0
+            close(fd)
+        }
+        if held != running {
+            running = held
+            if !held { zoom = 0 }
+        }
+    }
+
+    func start() {
+        message = "Asking the phone to start its camera…"
+        run(["--start"], wait: false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.refresh() }
+    }
+
+    func stop() {
+        run(["--stop"]) { _ in self.message = nil }
+    }
+
+    func switchCamera() {
+        run(["--switch-camera"])
+        zoom = 0 // the phone resets zoom when it switches
+    }
+
+    func toggleTorch() { run(["--torch"]) }
+
+    func setZoom(_ level: Int) {
+        zoom = min(max(level, 0), maxZoom)
+        run(["--zoom", String(zoom)])
+    }
+
+    private func run(_ args: [String], wait: Bool = true, done: ((Int32) -> Void)? = nil) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: binary)
+        p.arguments = args
+        // Same log as sessions the daemon starts for the phone's tile.
+        let log = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Logs/SmartConnect/smartconnect-webcam.log")
+        if !FileManager.default.fileExists(atPath: log.path) {
+            FileManager.default.createFile(atPath: log.path, contents: nil)
+        }
+        if let handle = try? FileHandle(forWritingTo: log) {
+            handle.seekToEndOfFile()
+            p.standardOutput = handle
+            p.standardError = handle
+        }
+        p.terminationHandler = { proc in
+            DispatchQueue.main.async {
+                if wait && proc.terminationStatus != 0 { self.message = "Webcam command failed (\(args.joined(separator: " ")))" }
+                if !wait { self.message = nil }
+                done?(proc.terminationStatus)
+                self.refresh()
+            }
+        }
+        do { try p.run() } catch { message = "Can't run smartconnect-webcam: \(error.localizedDescription)" }
+    }
+}
+
+/// The Webcam row of the menu panel's Phone card, like the Windows app's camera controls.
+struct WebcamControls: View {
+    private var _cam: ObservedObject<WebcamController> = ObservedObject(wrappedValue: WebcamController.shared)
+    private var cam: WebcamController { _cam.wrappedValue }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Button {
+                    cam.running ? cam.stop() : cam.start()
+                } label: {
+                    Label(cam.running ? "Stop webcam" : "Webcam",
+                          systemImage: cam.running ? "video.slash" : "web.camera")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                if cam.running {
+                    Button { cam.switchCamera() } label: { Image(systemName: "arrow.triangle.2.circlepath.camera") }
+                        .help("Front / back camera")
+                    Button { cam.toggleTorch() } label: { Image(systemName: "flashlight.on.fill") }
+                        .help("Light")
+                    Button { cam.setZoom(cam.zoom - 1) } label: { Image(systemName: "minus.magnifyingglass") }
+                        .disabled(cam.zoom == 0)
+                        .help("Zoom out")
+                    Text("\(cam.zoom)×").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    Button { cam.setZoom(cam.zoom + 1) } label: { Image(systemName: "plus.magnifyingglass") }
+                        .disabled(cam.zoom >= cam.maxZoom)
+                        .help("Zoom in")
+                }
+            }
+            .controlSize(.small)
+            Text(cam.message ?? (cam.running
+                ? "Pick “OBS Virtual Camera” in your video app."
+                : "Use the phone camera as this Mac's webcam."))
+                .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+        }
+        .onAppear { cam.startPolling() }
+        .onDisappear { cam.stopPolling() }
     }
 }
 
