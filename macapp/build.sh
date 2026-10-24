@@ -13,7 +13,7 @@ cd "$ROOT"
 
 APP_NAME="SmartConnect"
 BUNDLE_ID="app.smartconnect.mac"
-VERSION="0.1.1"
+VERSION="0.1.2"
 BUILD_DIR="$ROOT/build"
 APP="$BUILD_DIR/$APP_NAME.app"
 TARGET="arm64-apple-macosx13.0"

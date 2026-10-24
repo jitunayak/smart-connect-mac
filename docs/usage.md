@@ -109,10 +109,10 @@ Status: ✅ (Wi-Fi reconnect, Bluetooth LE wake, automatic reconnect)
 finds the PC over mDNS and asks it for an invite, then the phone dials the PC.
 
 **From the desktop:** the Connect/Disconnect button in the GTK app or the Noctalia panel, or the
-same buttons on the macOS app's menu-bar panel (Phone section) and its main window (*Phone* page,
+same button in the macOS app's menu-bar device card and its main window (*Phone* page,
 which also shows a dummy Motorola Edge 70 at the top of the left rail with the phone's live
 wallpaper, clock and battery — the daemon saves the wallpaper under the runtime dir; the rail holds
-the *Phone / Streams / Notifications / Settings* pages under it, like the Windows app), or:
+the *Phone / Notifications / Messages / Settings* pages under it, like the Windows app), or:
 
 ```sh
 smartconnectd connect      # prints {"message":"…","ok":true|false}
@@ -393,13 +393,13 @@ Each phone app opens in its own Linux window, titled after the app (for example
   `--app` goes through the stream host if one is running. Otherwise it streams from its own process
   and exits when its windows close.
 - **macOS app:** the phone's apps show as a **grid of launcher icons** (name under each icon;
-  hovering shows the package) in the *Streams* page of the SmartConnect window
-  (the window's left rail: dummy phone on top, then the Phone / Streams / Notifications / Settings
-  pages, like the Windows app) and in the
-  menu-bar panel's Streams card (smaller icon grid, cached icons and a search field; the circular
-  **Refresh** button asks the phone for the list again). **Clicking an icon starts that app on the
-  phone** (no separate Open button), and **Running
-  streams** lists the open streams with Close buttons. The list is cached in
+  hovering shows the package) in the *Phone* page of the SmartConnect window
+  (the window's left rail: dummy phone on top, then the Phone / Notifications / Messages / Settings
+  pages, like the Windows app), with a search field and a **Refresh** button that asks the phone
+  for the list again. **Clicking an icon starts that app on the phone** (no separate Open button),
+  and **Running streams** lists the open streams with Close buttons. The menu-bar panel does not
+  carry the app grid (only its running streams); *Mirror* and *Desktop* are the device card's round
+  actions. The list is cached in
   `~/Library/Caches/SmartConnect/apps-cache.json`, so a surface opens with the apps already in
   place and a fresh list is requested at most every 5 minutes while the phone is connected.
   Starting an app sends

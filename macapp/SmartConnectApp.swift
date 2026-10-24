@@ -615,9 +615,7 @@ final class CallMenuBarController: NSObject {
     }
 
     func refresh() {
-        let mode = currentMode
-        guard mode != nil else { return }
-        if mode == nil {
+        guard let mode = currentMode else {
             // Call over: close the popover and remove the pill.
             if popover?.isShown == true { popover?.performClose(nil) }
             popover = nil
@@ -632,10 +630,10 @@ final class CallMenuBarController: NSObject {
             i.button?.target = self
             i.button?.action = #selector(togglePopover(_:))
             item = i
-            updateSizingAndTint(mode!)
+            updateSizingAndTint(mode)
         }
-        updateSizingAndTint(mode!)
-        updateTitle(mode!)
+        updateSizingAndTint(mode)
+        updateTitle(mode)
     }
 
     private func updateSizingAndTint(_ mode: CallMode) {
@@ -1034,6 +1032,12 @@ final class DaemonClient: ObservableObject {
                         Task { @MainActor in
                             self.status = status
                             self.online = true
+                            // The daemon only reports the phone's name while it is connected; keep
+                            // the last one so the menu-bar card can still name a paired phone that
+                            // is offline instead of calling it "No phone paired".
+                            if let name = status.name, !name.isEmpty {
+                                UserDefaults.standard.set(name, forKey: "lastDeviceName")
+                            }
                         }
                     }
                 }
@@ -1453,15 +1457,55 @@ extension NotificationBridge: UNUserNotificationCenterDelegate {
 // MARK: - Window bridge
 
 @MainActor
-final class WindowActionBridge {
+final class WindowActionBridge: ObservableObject {
     static let shared = WindowActionBridge()
+
+    /// Section the main window should show the next time it comes forward (nil = leave it).
+    @Published var requestedSection: Int?
+    /// Ask the main window's Phone page to present the pairing QR sheet.
+    @Published var requestedPairing = false
 
     func openMain() {
         AppDelegate.shared?.showMainWindow()
     }
+
+    func openSection(_ section: Int) {
+        requestedSection = section
+        openMain()
+    }
+
+    /// Pair from the menu bar: generate the payload and make the window's Phone page show the QR.
+    func openPairing() {
+        DaemonClient.shared.pair()
+        requestedSection = 0
+        requestedPairing = true
+        openMain()
+    }
 }
 
 // MARK: - App delegate
+
+/// The app's theme preference. `system` (the default) follows macOS; `light` and `dark` force an
+/// appearance on the whole app — main window, menu-bar popover and the sheets alike — so it is
+/// independent of the system setting. Stored in defaults so it survives relaunches.
+enum AppAppearance {
+    static let key = "appearance"
+    static let system = "system"
+    static let light = "light"
+    static let dark = "dark"
+
+    static var current: String {
+        UserDefaults.standard.string(forKey: key) ?? system
+    }
+
+    static func apply(_ value: String = current) {
+        switch value {
+        case light: NSApp.appearance = NSAppearance(named: .aqua)
+        case dark: NSApp.appearance = NSAppearance(named: .darkAqua)
+        default: NSApp.appearance = nil
+        }
+    }
+}
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -1473,6 +1517,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
+        // Theme preference (Settings ✓ Appearance): System by default, or a forced Light/Dark.
+        // Applied before any window is created so the first frame already uses it.
+        AppAppearance.apply()
         if CommandLine.arguments.contains("--check-notifications") {
             UNUserNotificationCenter.current().getNotificationSettings { settings in
                 let out: [String: Any] = [
@@ -1587,24 +1634,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// only reaches the daemon through its command line changes; the phone reconnects on its own.
     func restartDaemon() {
         DispatchQueue.global(qos: .userInitiated).async {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-            p.arguments = ["-x", "smartconnectd"]
-            try? p.run()
-            p.waitUntilExit()
+            Self.stopDaemonAndHelpers(onlyStaleSince: nil)
             DispatchQueue.main.async {
                 AppDelegate.shared?.ensureDaemonRunning()
             }
         }
     }
 
+    /// A daemon or helper process that may still be running from an older copy of the app.
+    private struct DaemonProcess {
+        let pid: pid_t
+        let name: String
+        let started: Date
+    }
+
+    private static func runningDaemonProcesses() -> [DaemonProcess] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+        var size = 0
+        guard sysctl(&mib, u_int(mib.count), nil, &size, nil, 0) == 0, size > 0 else { return [] }
+        let stride = MemoryLayout<kinfo_proc>.stride
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: size / stride + 1)
+        guard sysctl(&mib, u_int(mib.count), &procs, &size, nil, 0) == 0 else { return [] }
+
+        let names: Set<String> = ["smartconnectd", "smartconnect-mac-helper"]
+        return procs.prefix(size / stride).compactMap { kp in
+            let pid = kp.kp_proc.p_pid
+            guard pid > 0 else { return nil }
+            let name = withUnsafeBytes(of: kp.kp_proc.p_comm) { raw in
+                String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
+            }
+            guard names.contains(name) else { return nil }
+            var info = proc_bsdinfo()
+            let infoSize = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, infoSize) == infoSize else { return nil }
+            return DaemonProcess(pid: pid, name: name,
+                                 started: Date(timeIntervalSince1970: TimeInterval(info.pbi_start_tvsec)))
+        }
+    }
+
+    /// Stops the daemon and the helpers it spawns. `onlyStaleSince` limits this to processes that
+    /// started before that date — i.e. ones left over from the copy of the app that an update just
+    /// replaced. They would otherwise keep the BLE peripheral and the old binary alive, so the new
+    /// copy would talk to a daemon it does not own and the phone would not come back without a new
+    /// QR scan. With `nil`, every daemon/helper is stopped (used by restartDaemon).
+    private static func stopDaemonAndHelpers(onlyStaleSince buildDate: Date?) {
+        var victims = runningDaemonProcesses()
+        if let buildDate {
+            victims = victims.filter { $0.started < buildDate.addingTimeInterval(-1) }
+        }
+        guard !victims.isEmpty else { return }
+        NSLog("SmartConnect: stopping \(victims.map(\.name).joined(separator: ",")) left over from a previous build")
+        for p in victims { kill(p.pid, SIGTERM) }
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline, victims.contains(where: { kill($0.pid, 0) == 0 }) {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        for p in victims where kill(p.pid, 0) == 0 { kill(p.pid, SIGKILL) }
+    }
+
     @discardableResult
     private func ensureDaemonRunning() -> Bool {
+        // After an update (in-app or `build.sh --install`) the old daemon and its helpers keep
+        // running from the replaced bundle: same paths, older inodes, still holding the phone's
+        // BLE advertisement. Restart them so this build's daemon re-advertises and its startup
+        // auto-reconnect can bring the already-paired phone back without a QR scan.
+        let bundledDaemon = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/smartconnectd").path
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: bundledDaemon),
+           let built = attrs[.modificationDate] as? Date {
+            Self.stopDaemonAndHelpers(onlyStaleSince: built)
+        }
         // Short timeout: this runs on the main thread during launch.
         if UnixSocket.connect(path: Paths.controlSocket, timeout: 0.5) != nil { return true }
         // Prefer the daemon inside our own bundle, then PATH.
-        let bundled = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/smartconnectd").path
-        let candidate = FileManager.default.isExecutableFile(atPath: bundled) ? bundled : "smartconnectd"
+        let candidate = FileManager.default.isExecutableFile(atPath: bundledDaemon) ? bundledDaemon : "smartconnectd"
         let p = Process()
         p.executableURL = URL(fileURLWithPath: candidate)
         p.arguments = AppDelegate.daemonArguments()
@@ -1663,6 +1765,8 @@ struct SmartConnectApp: App {
 struct MenuContent: View {
     private var _daemon: EnvironmentObject<DaemonClient> = EnvironmentObject()
     private var daemon: DaemonClient { _daemon.wrappedValue }
+    private var _host: ObservedObject<StreamHost> = ObservedObject(wrappedValue: StreamHost.shared)
+    private var host: StreamHost { _host.wrappedValue }
     // The panel hosts the Phone (with the streaming controls), Messages and Notifications
     // sections directly (they used to be reachable only through the main window); the
     // full-sized pages stay there too.
@@ -1670,33 +1774,22 @@ struct MenuContent: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            // Header card: connection ring, device identity and battery as a small badge.
-            HStack(spacing: 10) {
-                ZStack {
-                    Circle()
-                        .fill(daemon.status?.connected == true ? Color.green.opacity(0.16) : Color.secondary.opacity(0.14))
-                        .frame(width: 38, height: 38)
-                    Image(systemName: daemon.status?.connected == true ? "iphone.radiowaves.left.and.right" : "iphone.slash")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(daemon.status?.connected == true ? Color.green : Color.secondary)
-                }
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(daemon.status?.name ?? "Smart Connect")
-                        .font(.system(.callout, design: .default, weight: .semibold))
-                    Text(statusLine).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                }
+            // Title row, Tether-style: app name on the left, live connection state on the right.
+            HStack(spacing: 6) {
+                Text("Smart Connect")
+                    .font(.system(.title3, design: .default, weight: .bold))
                 Spacer()
-                if let s = daemon.status, s.connected, let battery = s.battery {
-                    HStack(spacing: 4) {
-                        Image(systemName: s.charging ? "bolt" : (battery > 50 ? "battery.75" : "battery.25"))
-                            .font(.system(size: 11))
-                        Text("\(battery)%").font(.caption2).fontWeight(.medium)
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Capsule().fill(Color.primary.opacity(0.06)))
-                }
+                Circle()
+                    .fill(connectionColor)
+                    .frame(width: 7, height: 7)
+                Text(connectionLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
+            .padding(.horizontal, 2)
+
+            deviceCard
 
             // Call banner in the iPhone-calling style: ringing (Accept/Decline circles) or
             // ongoing (End circle), however the call was picked up.
@@ -1716,14 +1809,6 @@ struct MenuContent: View {
                         .strokeBorder(Color.primary.opacity(0.07)))
             }
 
-            Picker("Panel", selection: _section.projectedValue) {
-                Image(systemName: "iphone").tag(0)
-                Image(systemName: "ellipsis.message").tag(1)
-                Image(systemName: "bell").tag(2)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-
             Group {
                 switch _section.wrappedValue {
                 case 0: MenuPhoneSection()
@@ -1735,102 +1820,265 @@ struct MenuContent: View {
             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.primary.opacity(0.07)))
 
-            HStack(spacing: 8) {
-                Button {
+            // Menu-style rows: Open, Settings, Quit.
+            VStack(spacing: 1) {
+                MenuRowButton(title: "Open Smart Connect", icon: "macwindow") {
                     WindowActionBridge.shared.openMain()
                     NSApp.activate(ignoringOtherApps: true)
-                } label: {
-                    Label("Open", systemImage: "macwindow")
-                        .font(.caption)
                 }
-                .controlSize(.small)
-                Spacer()
-                Button {
+                // The card's first action is Pair only while no phone is paired; keep pairing
+                // reachable here once it is.
+                if daemon.status?.paired == true {
+                    MenuRowButton(title: "Pair new phone…", icon: "qrcode") {
+                        WindowActionBridge.shared.openPairing()
+                    }
+                }
+                MenuRowButton(title: "Settings…", icon: "gearshape") {
+                    WindowActionBridge.shared.openSection(3)
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+                MenuRowButton(title: "Quit Smart Connect", icon: "power") {
                     NSApp.terminate(nil)
-                } label: {
-                    Label("Quit", systemImage: "power")
-                        .font(.caption)
                 }
-                .controlSize(.small)
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+            .padding(.top, 2)
         }
         .padding(12)
         .frame(width: 364)
     }
 
-    private var statusLine: String {
-        guard daemon.online else { return "smartconnectd is not running" }
-        guard let s = daemon.status else { return "Connecting to smartconnectd…" }
-        if s.connected { return s.model ?? "Connected" }
-        if s.paired { return "Paired · not connected" }
+    /// The Tether-style device card: phone outline, bold name, status pills and three quick
+    /// actions. Everything is live off `PhoneStatus`, so it doubles as the at-a-glance header.
+    private var deviceCard: some View {
+        let s = daemon.status
+        let connected = s?.connected == true
+        return VStack(spacing: 14) {
+            HStack(spacing: 14) {
+                PhoneOutlineGlyph(active: connected)
+                VStack(alignment: .leading, spacing: 7) {
+                    // Fixed size, not minimumScaleFactor: the panel's width can shift a little
+                    // between the Messages and Notifications sections, and the name must not
+                    // change size when it does. Long names truncate instead.
+                    Text(deviceName(s))
+                        .font(.system(.title2, design: .default, weight: .bold))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    HStack(spacing: 6) {
+                        DeviceStatusPill(
+                            icon: "wifi",
+                            text: s?.wifi == true ? "Wi-Fi" : "Off",
+                            tint: s?.wifi == true ? .green : .secondary)
+                        DeviceStatusPill(
+                            icon: batteryIcon(s),
+                            text: s?.battery.map { "\($0)%" } ?? "—",
+                            tint: .secondary)
+                        DeviceStatusPill(
+                            icon: "cellularbars",
+                            text: signalWord(s?.cellSignal),
+                            tint: .secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            HStack(spacing: 8) {
+                if connected {
+                    quickAction(icon: "iphone.slash", label: "Disconnect", enabled: !daemon.busy) {
+                        daemon.disconnect()
+                    }
+                } else if s?.paired == true {
+                    quickAction(icon: "link", label: "Connect", enabled: daemon.online && !daemon.busy) {
+                        daemon.connect()
+                    }
+                } else {
+                    quickAction(icon: "qrcode", label: "Pair", enabled: daemon.online) {
+                        WindowActionBridge.shared.openPairing()
+                    }
+                }
+                quickAction(icon: "play.rectangle", label: "Mirror", enabled: connected) {
+                    host.startView(1)
+                }
+                quickAction(icon: "desktopcomputer", label: "Desktop", enabled: connected) {
+                    host.startView(2)
+                }
+                // Messages and Notifications used to sit behind a segmented picker; they are
+                // panel switches now, so the same icon row carries them. Tapping the selected
+                // one again returns to the Phone panel.
+                quickAction(icon: "ellipsis.message", label: "SMS",
+                            enabled: true, selected: _section.wrappedValue == 1) {
+                    _section.wrappedValue = _section.wrappedValue == 1 ? 0 : 1
+                }
+                quickAction(icon: "bell", label: "Alerts",
+                            enabled: true, selected: _section.wrappedValue == 2) {
+                    _section.wrappedValue = _section.wrappedValue == 2 ? 0 : 2
+                }
+            }
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(.regularMaterial)
+                .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color.primary.opacity(0.05))))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
+            .strokeBorder(Color.primary.opacity(0.10)))
+    }
+
+    private func quickAction(icon: String, label: String, enabled: Bool,
+                             selected: Bool = false,
+                             action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(selected ? Color.white
+                                     : (enabled ? Color.primary : Color.secondary))
+                    .frame(width: 46, height: 46)
+                    .background(Circle().fill(selected ? Color.accentColor
+                                                : Color.primary.opacity(0.07)))
+                    .overlay(Circle().strokeBorder(selected ? Color.clear
+                                                     : Color.primary.opacity(0.08)))
+                Text(label)
+                    .font(.caption2)
+                    .foregroundStyle(selected ? Color.accentColor : .secondary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.45)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    private func deviceName(_ s: PhoneStatus?) -> String {
+        if let name = s?.name, !name.isEmpty { return name }
+        if let model = s?.model, !model.isEmpty { return model }
+        // Disconnected but still paired: the daemon reports no name then, so fall back to the last
+        // one it sent rather than claiming no phone is paired.
+        if s?.paired == true,
+           let last = UserDefaults.standard.string(forKey: "lastDeviceName"), !last.isEmpty {
+            return last
+        }
+        return "No phone paired"
+    }
+
+    private func batteryIcon(_ s: PhoneStatus?) -> String {
+        guard let battery = s?.battery else { return "battery.0" }
+        if s?.charging == true { return "battery.100.bolt" }
+        switch battery {
+        case ..<13: return "battery.0"
+        case ..<38: return "battery.25"
+        case ..<63: return "battery.50"
+        case ..<88: return "battery.75"
+        default: return "battery.100"
+        }
+    }
+
+    /// The phone reports 0–5 (None … Excellent); unknown stays "Unknown" like the reference.
+    private func signalWord(_ level: Int?) -> String {
+        guard let level else { return "Unknown" }
+        let words = ["None", "Very weak", "Weak", "Fair", "Good", "Excellent"]
+        return words[max(0, min(words.count - 1, level))]
+    }
+
+    private var connectionLabel: String {
+        guard daemon.online else { return "Daemon offline" }
+        guard let s = daemon.status else { return "Connecting…" }
+        if s.connected { return "Connected" }
+        if s.paired { return "Paired" }
         return "Not paired"
+    }
+
+    private var connectionColor: Color {
+        if daemon.status?.connected == true { return .green }
+        return daemon.online ? .orange : .secondary
     }
 }
 
-/// The menu panel's Phone section: connection controls, the streaming actions (the old Streams
-/// segment, merged in), running streams, the phone's app list and the last action message.
+/// The reference UI's phone outline: a blue rounded rectangle with a notch and a home line.
+private struct PhoneOutlineGlyph: View {
+    let active: Bool
+
+    var body: some View {
+        let color = active ? Color.blue : Color.secondary
+        return ZStack {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(color, lineWidth: 2.5)
+            VStack {
+                Capsule().fill(color).frame(width: 8, height: 2.5).padding(.top, 5)
+                Spacer()
+                Capsule().fill(color).frame(width: 10, height: 2).padding(.bottom, 5)
+            }
+        }
+        .frame(width: 30, height: 50)
+        .frame(width: 34, height: 54)
+    }
+}
+
+/// A compact capsule badge for one device fact (Wi-Fi, battery, mobile signal).
+private struct DeviceStatusPill: View {
+    let icon: String
+    let text: String
+    let tint: Color
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(tint)
+            Text(text)
+                .font(.caption2)
+                .fontWeight(.semibold)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Capsule().fill(Color.primary.opacity(0.07)))
+    }
+}
+
+/// A menu row with the hover highlight the reference popover uses.
+private struct MenuRowButton: View {
+    let title: String
+    let icon: String
+    let action: () -> Void
+    private var _hover: State<Bool> = State(initialValue: false)
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 14, weight: .medium))
+                    .frame(width: 20)
+                Text(title)
+                    .font(.system(.callout, design: .default, weight: .medium))
+                Spacer()
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(_hover.wrappedValue ? Color.primary.opacity(0.07) : Color.clear))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { _hover.wrappedValue = $0 }
+    }
+}
+
+/// The menu panel's Phone section: the running streams and the last action message. Connection
+/// and mirror actions live in the device card above; the app list stays in the main window, so the
+/// menu bar panel does not turn into a second app launcher.
 struct MenuPhoneSection: View {
     private var _daemon: EnvironmentObject<DaemonClient> = EnvironmentObject()
     private var daemon: DaemonClient { _daemon.wrappedValue }
     private var _host: ObservedObject<StreamHost> = ObservedObject(wrappedValue: StreamHost.shared)
     private var host: StreamHost { _host.wrappedValue }
-    private var _search: State<String> = State(initialValue: "")
-    private var search: String { _search.wrappedValue }
-
-    private var filtered: [StreamHost.StreamApp] {
-        host.apps.filter {
-            search.isEmpty
-                || $0.name.localizedCaseInsensitiveContains(search)
-                || $0.pkg.localizedCaseInsensitiveContains(search)
-        }
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Button {
-                    daemon.status?.connected == true ? daemon.disconnect() : daemon.connect()
-                } label: {
-                    Label(daemon.status?.connected == true ? "Disconnect" : "Connect",
-                          systemImage: daemon.status?.connected == true ? "iphone.slash" : "link")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(daemon.busy || daemon.online == false)
-
-                Button {
-                    daemon.pair()
-                    WindowActionBridge.shared.openMain()
-                    NSApp.activate(ignoringOtherApps: true)
-                } label: {
-                    Label("Pair…", systemImage: "qrcode").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(daemon.online == false)
-
-                Button {
-                    host.startView(1)
-                } label: {
-                    Label("Screen share", systemImage: "play.rectangle")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(daemon.status?.connected != true)
-
-                Button {
-                    host.startView(2)
-                } label: {
-                    Label("Desktop", systemImage: "desktopcomputer")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(daemon.status?.connected != true)
-            }
-
             if let message = daemon.lastMessage, !message.isEmpty {
                 Text(message).font(.caption).foregroundStyle(.secondary).lineLimit(2)
             }
@@ -1845,38 +2093,18 @@ struct MenuPhoneSection: View {
                 .font(.callout)
             }
 
-            if host.apps.isEmpty {
+            if host.streamList.isEmpty, (daemon.lastMessage ?? "").isEmpty {
                 Text(daemon.status?.connected == true
-                     ? "No app list yet — the phone sends it shortly after connecting; Refresh asks again."
-                     : "Connect the phone to load its apps.")
+                     ? "No active streams. Use Mirror or Desktop above."
+                     : "Connect the phone to start mirroring.")
                     .font(.caption).foregroundStyle(.secondary)
-            } else {
-                HStack {
-                    TextField("Search apps", text: _search.projectedValue)
-                        .textFieldStyle(.roundedBorder)
-                        .controlSize(.small)
-                    Button {
-                        host.requestApps()
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    .disabled(daemon.status?.connected != true)
-                }
-                ScrollView {
-                    StreamAppSections(apps: filtered, cellMin: 62, twoLineName: false) { app in
-                        host.startApp(app)
-                    }
-                }
-                .frame(maxHeight: 320)
             }
         }
-        .onAppear { host.requestAppsIfStale() }
     }
 }
 
-/// One icon cell of the phone-app grid (the Streams section of the window's Phone page and the
-/// menu panel's Phone card): the launcher icon with the app name under it; a click starts the
-/// app on the phone.
+/// One icon cell of the phone-app grid (the Streams section of the window's Phone page): the
+/// launcher icon with the app name under it; a click starts the app on the phone.
 private struct StreamAppGridCell: View {
     let app: StreamHost.StreamApp
     let iconSize: CGFloat
@@ -1917,7 +2145,7 @@ private struct StreamAppGridCell: View {
 
 /// The phone-app grid in the phone-picker's sections: Games, TV apps, then everything else
 /// (the header is left off when no other section has content, so a plain list looks flat).
-/// Both the menu panel's Phone card and the window's Phone page take this.
+/// The window's Phone page takes this; the menu panel keeps only streams, not an app launcher.
 private struct StreamAppSections: View {
     let apps: [StreamHost.StreamApp]
     let cellMin: CGFloat
@@ -2081,33 +2309,42 @@ struct MenuMessagesSection: View {
                     .lineLimit(1)
                 Spacer()
             }
-            ScrollView {
-                VStack(alignment: .leading, spacing: 3) {
-                    if messages.isEmpty {
-                        Text("No cached messages yet.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    ForEach(messages, id: \.self) { m in
-                        HStack {
-                            if m.sent { Spacer(minLength: 36) }
-                            Text(LinkText.body(m.body, sent: m.sent))
-                                .font(.caption)
-                                .environment(\.openURL, OpenURLAction { url in
-                                    NSWorkspace.shared.open(url)
-                                    return .handled
-                                })
-                                .textSelection(.enabled)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                    .fill(m.sent ? Color.accentColor.opacity(0.85) : Color.primary.opacity(0.08)))
-                                .foregroundStyle(m.sent ? Color.white : Color.primary)
-                            if !m.sent { Spacer(minLength: 36) }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 3) {
+                        if messages.isEmpty {
+                            Text("No cached messages yet.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        ForEach(messages, id: \.self) { m in
+                            HStack {
+                                if m.sent { Spacer(minLength: 36) }
+                                Text(LinkText.body(m.body, sent: m.sent))
+                                    .font(.caption)
+                                    .environment(\.openURL, OpenURLAction { url in
+                                        NSWorkspace.shared.open(url)
+                                        return .handled
+                                    })
+                                    .textSelection(.enabled)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .fill(m.sent ? Color.accentColor.opacity(0.85) : Color.primary.opacity(0.08)))
+                                    .foregroundStyle(m.sent ? Color.white : Color.primary)
+                                if !m.sent { Spacer(minLength: 36) }
+                            }
+                            .id(m.id)
                         }
                     }
                 }
+                .id(key) // a new conversation starts with a fresh scroll position
+                .onAppear { scrollToLatest(proxy) }
+                .onChange(of: messages.last?.id) { _ in scrollToLatest(proxy, animated: true) }
             }
-            .frame(maxHeight: 230)
+            // A fixed height, not maxHeight: inside the menu-bar popover the window sizes itself
+            // to the content, and a flexible ScrollView has no ideal height — the conversation
+            // collapsed to a few unreadable points. 230 pt keeps the bubbles readable.
+            .frame(height: 230)
             HStack(spacing: 6) {
                 TextField("Text message…", text: _draft.projectedValue)
                     .textFieldStyle(.roundedBorder)
@@ -2125,6 +2362,20 @@ struct MenuMessagesSection: View {
     }
 
     // MARK: actions
+
+    /// Keep the newest message in view: on open (no animation) and when the thread grows.
+    private func scrollToLatest(_ proxy: ScrollViewProxy, animated: Bool = false) {
+        guard let last = messages.last else { return }
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    proxy.scrollTo(last.id, anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo(last.id, anchor: .bottom)
+            }
+        }
+    }
 
     private func refreshThreads() async {
         let r = await requestJSON(["cmd": "sms_threads"])
@@ -2294,6 +2545,7 @@ struct MainWindow: View {
     private var _daemon: EnvironmentObject<DaemonClient> = EnvironmentObject()
     private var daemon: DaemonClient { _daemon.wrappedValue }
     private var _section: State<Int> = State(initialValue: 0)
+    private var _bridge: ObservedObject<WindowActionBridge> = ObservedObject(wrappedValue: WindowActionBridge.shared)
 
     var body: some View {
         // Phone-Link-style layout in a glass window: vibrancy draws under everything (including
@@ -2333,6 +2585,15 @@ struct MainWindow: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.ultraThinMaterial)
+        .onAppear { consumeRequestedSection() }
+        .onChange(of: _bridge.wrappedValue.requestedSection) { _ in consumeRequestedSection() }
+    }
+
+    /// The menu panel's "Settings…" row asks the window to switch pages before it comes forward.
+    private func consumeRequestedSection() {
+        guard let requested = _bridge.wrappedValue.requestedSection else { return }
+        _section.wrappedValue = requested
+        _bridge.wrappedValue.requestedSection = nil
     }
 
     private func navItem(_ tag: Int, icon: String, label: String) -> some View {
@@ -2437,6 +2698,7 @@ struct PhoneView: View {
     private var _host: ObservedObject<StreamHost> = ObservedObject(wrappedValue: StreamHost.shared)
     private var host: StreamHost { _host.wrappedValue }
     private var _showPairing: State<Bool> = State(initialValue: false)
+    private var _bridge: ObservedObject<WindowActionBridge> = ObservedObject(wrappedValue: WindowActionBridge.shared)
 
     var body: some View {
         ScrollView {
@@ -2526,6 +2788,22 @@ struct PhoneView: View {
             PairingView(payload: daemon.status?.pairingPayload)
                 .frame(width: 460, height: 560)
         }
+        .onAppear { consumePairingRequest() }
+        .onChange(of: _bridge.wrappedValue.requestedPairing) { _ in consumePairingRequest() }
+        // Once the scanned phone connects, the QR has done its job: close the sheet instead of
+        // leaving it up until the user finds Done.
+        .onChange(of: daemon.status?.connected) { connected in
+            if connected == true, _showPairing.wrappedValue {
+                _showPairing.wrappedValue = false
+            }
+        }
+    }
+
+    /// The menu-bar Pair action routes through the window bridge: switch to Phone and show the QR.
+    private func consumePairingRequest() {
+        guard _bridge.wrappedValue.requestedPairing else { return }
+        _bridge.wrappedValue.requestedPairing = false
+        _showPairing.wrappedValue = true
     }
 }
 
@@ -2567,8 +2845,12 @@ struct Edge70PhoneView: View {
     }
 
     private func screen(_ date: Date) -> some View {
+        // Keep the geometry honest: the screen is the inner size, the body is that plus the
+        // bezel on every side. (The old code sized the screen as the body and then padded the
+        // body outwards, which stretched the wallpaper and pushed the body past its layout box.)
         let inner = Self.width - Self.bezel * 2
-        let h = inner * Self.screenAspect + Self.bezel * 2
+        let innerHeight = inner * Self.screenAspect
+        let bodyHeight = innerHeight + Self.bezel * 2
         return ZStack {
             if let img = wallpaper {
                 Image(nsImage: img).resizable().scaledToFill()
@@ -2642,7 +2924,9 @@ struct Edge70PhoneView: View {
                 .frame(maxHeight: .infinity, alignment: .top)
                 .padding(.top, 10)
         }
+        .frame(width: inner, height: innerHeight)
         .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .frame(width: Self.width, height: bodyHeight)
         .background(
             RoundedRectangle(cornerRadius: 33, style: .continuous)
                 .fill(LinearGradient(stops: [
@@ -2650,13 +2934,10 @@ struct Edge70PhoneView: View {
                     .init(color: Color(white: 0.12), location: 1),
                 ], startPoint: .topLeading, endPoint: .bottomTrailing))
                 .shadow(color: .black.opacity(0.3), radius: 8, y: 4)
-                .padding(-Self.bezel)
         )
-        .frame(width: Self.width, height: h)
         .overlay(
             RoundedRectangle(cornerRadius: 33, style: .continuous)
                 .strokeBorder(.black.opacity(0.55), lineWidth: 1)
-                .padding(-Self.bezel)
         )
     }
 }
@@ -2683,9 +2964,6 @@ struct PairingView: View {
     var body: some View {
         VStack(spacing: 14) {
             Text("Pair with Smart Connect").font(.title2.bold())
-            Text("On the phone, open Smart Connect, tap +, and scan this code.")
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
             if let payload, let image = QRCode.image(for: payload) {
                 Image(nsImage: image)
                     .interpolation(.none)
@@ -3237,10 +3515,22 @@ struct MessagesView: View {
                     .padding(10)
                 }
             }
-            .onChange(of: messages.count) { _ in
-                if let last = messages.last {
+            .id(key) // a new conversation starts with a fresh scroll position
+            .onAppear { scrollToLatest(proxy) }
+            .onChange(of: messages.last?.id) { _ in scrollToLatest(proxy, animated: true) }
+        }
+    }
+
+    /// Keep the newest message in view: on open (no animation) and when the thread grows.
+    private func scrollToLatest(_ proxy: ScrollViewProxy, animated: Bool = false) {
+        guard let last = messages.last else { return }
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.2)) {
                     proxy.scrollTo(last.id, anchor: .bottom)
                 }
+            } else {
+                proxy.scrollTo(last.id, anchor: .bottom)
             }
         }
     }
@@ -3906,6 +4196,11 @@ struct SettingsView: View {
             UserDefaults.standard.set(newValue, forKey: "showInDock")
         }
     }
+    private var _appearance: State<String> = State(initialValue: AppAppearance.current)
+    private var appearance: String {
+        get { _appearance.wrappedValue }
+        nonmutating set { _appearance.wrappedValue = newValue }
+    }
     private var _allTiles: State<Bool> = State(initialValue: UserDefaults.standard.bool(forKey: "allTiles"))
     private var allTiles: Bool {
         get { _allTiles.wrappedValue }
@@ -4001,6 +4296,20 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
             Section("Appearance") {
+                Picker("Theme", selection: _appearance.projectedValue) {
+                    Text("System").tag(AppAppearance.system)
+                    Text("Light").tag(AppAppearance.light)
+                    Text("Dark").tag(AppAppearance.dark)
+                }
+                .onChange(of: appearance) { value in
+                    // Saved for the next launch and applied now, so the window, the menu-bar
+                    // panel and any open sheet switch together.
+                    UserDefaults.standard.set(value, forKey: AppAppearance.key)
+                    AppAppearance.apply(value)
+                }
+                Text("System follows the Mac's Light/Dark setting. Light and Dark force the app's own theme — useful when the phone's UI or a screen recording should stay readable either way. Applies immediately and is remembered across launches.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Toggle("Show SmartConnect in the Dock", isOn: _showInDock.projectedValue)
                     .onChange(of: showInDock) { on in
                         // Takes effect immediately; also saved for the next launch. The toggle

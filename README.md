@@ -54,8 +54,8 @@ a CLI cannot do on macOS (pasteboard, Bluetooth LE, screen lock).
 <details open>
 <summary><h2>Install</h2></summary>
 
-1. Download **`SmartConnect-0.1.0.dmg`** from the
-   [v0.1.0 release](https://github.com/jitunayak/smart-connect-mac/releases/tag/v0.1.0).
+1. Download **`SmartConnect-0.1.2.dmg`** from the
+   [v0.1.2 release](https://github.com/jitunayak/smart-connect-mac/releases/tag/v0.1.2).
 2. Open the disk image and drag **SmartConnect** into **Applications**.
 3. Launch it. It has no Dock icon by default and lives in the **menu bar** (click the phone glyph
    to open the panel, or *Open* to show the main window).
@@ -77,8 +77,8 @@ Allow **Bluetooth** too if you want the phone to be woken while Smart Connect is
 The phone, the Mac and the daemon all need to be on the same Wi-Fi network and subnet (discovery
 uses mDNS).
 
-1. **Pair.** In the app, open the menu-bar panel and press **Pair new phone...** (or the equivalent
-   in the main window). A QR code appears. On the phone, open **Smart Connect**, tap **+**, choose
+1. **Pair.** In the app, open the menu-bar panel and press **Pair** (or *Pair new phone…* when a
+   phone is already paired), or use the equivalent in the main window. A QR code appears. On the phone, open **Smart Connect**, tap **+**, choose
    **Scan QR code** and scan it. The Mac then appears in the phone's device list.
 2. **Connect.** The first connection happens right after pairing. Afterwards, tap **Connect** on the
    Mac's tile in the phone app, or press **Connect** in the menu-bar panel. The daemon also
@@ -149,7 +149,8 @@ its protocol work with the Linux project, so details on each service live in the
 <details>
 <summary><h2>Streams</h2></summary>
 
-The **Phone** page (and the menu-bar panel) carries the streaming controls:
+The **Phone** page carries the streaming controls (the menu-bar device card has **Mirror** and
+**Desktop** quick actions):
 
 - **Mirror screen** and **Mobile desktop** buttons start a whole-screen stream.
 - **Running streams** lists everything currently streaming, with a **Close** button per row (which
@@ -246,6 +247,9 @@ The Settings page has:
   pairing state live in the state folder, so they survive the switch. **View release** is the
   manual way: the release page opens in your browser (dmg, `brew`, a fresh
   [build](#build-from-source)).
+- **Theme** — *System* (default), *Light* or *Dark*. System follows the Mac's appearance; the
+  forced modes theme the whole app (main window, menu-bar panel and sheets) immediately and are
+  remembered across launches.
 - **Show SmartConnect in the Dock** — off by default (menu bar only); on gives the app a Dock tile.
 - **Stream apps in** — *Landscape (tablet size)* (default) or *Portrait (phone shape)*. See
   [Streams](#streams).
